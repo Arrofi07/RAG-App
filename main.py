@@ -1,97 +1,183 @@
+# main.py
 
-import logging
-from fastapi import FastAPI
-import inngest
-import inngest.fast_api
-from inngest.experimental import ai
-from dotenv import load_dotenv
-import uuid
 import os
-import datetime
+import uuid
+import tempfile
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from google import genai
+
 from data_loader import load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
-from custom_types import RAQQueryResult, RAGSearchResult, RAGUpsertResult, RAGChunkAndSrc
 
 load_dotenv()
 
-inngest_client = inngest.Inngest(
-    app_id="rag-app",
-    logger=logging.getLogger("uvicorn"),
-    is_production=False,
-    serializer=inngest.PydanticSerializer()
+# -------------------------
+# Configuration
+# -------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set.")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+app = FastAPI(
+    title="RAG PDF API",
+    version="1.0.0",
 )
 
-@inngest_client.create_function(
-    fn_id="RAG: Ingest PDF",
-    trigger=inngest.TriggerEvent(event="rag/ingest_pdf")
-)
+store = QdrantStorage()
 
-async def rag_ingest_pdf(ctx: inngest.Context):
-    def _load(ctx: inngest.Context) -> RAGChunkAndSrc:
-        pdf_path = ctx.event.data["pdf_path"]
-        source_id = ctx.event.data.get("source_id", pdf_path)
+
+# -------------------------
+# Request Model
+# -------------------------
+
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 5
+
+
+# -------------------------
+# Health Check
+# -------------------------
+
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "message": "RAG API is ready."
+    }
+
+
+# -------------------------
+# Ingest PDF
+# -------------------------
+
+@app.post("/ingest")
+async def ingest_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are supported."
+        )
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".pdf"
+    ) as tmp:
+        contents = await file.read()
+        tmp.write(contents)
+        pdf_path = tmp.name
+
+    try:
         chunks = load_and_chunk_pdf(pdf_path)
-        return RAGChunkAndSrc(chunks=chunks, source_id=source_id)
 
-    def _upsert(chunks_and_src: RAGChunkAndSrc) -> RAGUpsertResult:
-        chunks = chunks_and_src.chunks
-        source_id = chunks_and_src.source_id
-        vecs = embed_texts(chunks)
-        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}")) for i in range(len(chunks))]
-        payloads = [{"source": source_id, "text": chunks[i]} for i in range(len(chunks))]
-        QdrantStorage().upsert(ids, vecs, payloads)
-        return RAGUpsertResult(ingested=len(chunks))
+        if len(chunks) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No text found in PDF."
+            )
 
-    chunks_and_src = await ctx.step.run("load-and-chunk", lambda: _load(ctx), output_type=RAGChunkAndSrc)
-    ingested = await ctx.step.run("embed-and-upsert", lambda: _upsert(chunks_and_src), output_type=RAGUpsertResult)
-    return ingested.model_dump()
+        vectors = embed_texts(chunks)
 
-@inngest_client.create_function(
-    fn_id="RAG: Query PDF",
-    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai")
-)
-async def rag_query_pdf_ai(ctx: inngest.Context):
-    def _search(question: str, top_k: int = 5) -> RAGSearchResult:
-        query_vec = embed_texts([question])[0]
-        store = QdrantStorage()
-        found = store.search(query_vec, top_k)
-        return RAGSearchResult(contexts=found["contexts"], sources=found["sources"])
+        source_id = file.filename
 
-    question = ctx.event.data["question"]
-    top_k = int(ctx.event.data.get("top_k", 5))
+        ids = [
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{source_id}:{i}"
+                )
+            )
+            for i in range(len(chunks))
+        ]
 
-    found = await ctx.step.run("embed-and-search", lambda: _search(question, top_k), output_type=RAGSearchResult)
+        payloads = [
+            {
+                "source": source_id,
+                "text": chunks[i],
+            }
+            for i in range(len(chunks))
+        ]
 
-    context_block = "\n\n".join(f"- {c}" for c in found.contexts)
-    user_content = (
-        "Use the following context to answer the question.\n\n"
-        f"Context:\n{context_block}\n\n"
-        f"Question: {question}\n"
-        "Answer concisely using the context above."
-    )
+        store.upsert(
+            ids=ids,
+            vectors=vectors,
+            payloads=payloads,
+        )
 
-    adapter = ai.openai.Adapter(
-        auth_key=os.getenv("GEMINI_API_KEY"),
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        model="gemini-2.5-flash",
-    )
-
-    res = await ctx.step.ai.infer(
-        "llm-answer",
-        adapter=adapter,
-        body={
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": "You answer questions using only the provided context."},
-                {"role": "user", "content": user_content}
-            ]
+        return {
+            "success": True,
+            "source": source_id,
+            "chunks": len(chunks),
         }
+
+    finally:
+        Path(pdf_path).unlink(missing_ok=True)
+
+
+# -------------------------
+# Query
+# -------------------------
+
+@app.post("/query")
+def query(req: QueryRequest):
+    question = req.question.strip()
+
+    if question == "":
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty."
+        )
+
+    question_vector = embed_texts([question])[0]
+
+    result = store.search(
+        question_vector,
+        top_k=req.top_k,
     )
 
-    answer = res["choices"][0]["message"]["content"].strip()
-    return {"answer": answer, "sources": found.sources, "num_contexts": len(found.contexts)}
+    contexts = result["contexts"]
+    sources = result["sources"]
 
-app = FastAPI()
+    context_block = "\n\n".join(
+        f"- {c}" for c in contexts
+    )
 
-inngest.fast_api.serve(app, inngest_client, [rag_ingest_pdf, rag_query_pdf_ai])
+    prompt = f"""
+You are a helpful assistant.
+
+Answer ONLY using the provided context.
+If the answer is not contained in the context,
+say that you don't know.
+
+Context:
+
+{context_block}
+
+Question:
+
+{question}
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    answer = ""
+
+    if hasattr(response, "text") and response.text:
+        answer = response.text.strip()
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "num_contexts": len(contexts),
+    }

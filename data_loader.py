@@ -1,38 +1,84 @@
 # data_loader.py
 
-from google import genai
-from llama_index.readers.file import PDFReader
-from llama_index.core.node_parser import SentenceSplitter
-from dotenv import load_dotenv
 import os
 from dotenv import load_dotenv
 
+from google import genai
+from llama_index.readers.file import PDFReader
+from llama_index.core.node_parser import SentenceSplitter
+
 load_dotenv()
 
-client = genai.Client()
-EMBED_MODEL = "text-embedding-3-large"
+# -------------------------
+# Gemini Client
+# -------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set.")
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Gemini embedding model
+EMBED_MODEL = "gemini-embedding-001"
+
+# Dimension used by your Qdrant collection
 EMBED_DIM = 3072
 
-splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=200)
+# -------------------------
+# Text splitter
+# -------------------------
 
-def load_and_chunk_pdf(path: str):
+splitter = SentenceSplitter(
+    chunk_size=1000,
+    chunk_overlap=200,
+)
+
+# -------------------------
+# Load PDF and split
+# -------------------------
+
+def load_and_chunk_pdf(path: str) -> list[str]:
     docs = PDFReader().load_data(file=path)
-    texts = [d.text for d in docs if getattr(d, "text", None)]
+
+    texts = [
+        doc.text
+        for doc in docs
+        if getattr(doc, "text", None)
+    ]
+
     chunks = []
-    for t in texts:
-        chunks.extend(splitter.split_text(t))
+
+    for text in texts:
+        chunks.extend(
+            splitter.split_text(text)
+        )
+
     return chunks
 
+
+# -------------------------
+# Generate embeddings
+# -------------------------
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     embeddings = []
 
     for text in texts:
         response = client.models.embed_content(
-            model="gemini-embedding-001",
+            model=EMBED_MODEL,
             contents=text,
         )
 
-        embeddings.append(response.embeddings[0].values)
+        # SDK versions expose either `embeddings` or `embedding`
+        if hasattr(response, "embeddings"):
+            embeddings.append(response.embeddings[0].values)
+        elif hasattr(response, "embedding"):
+            embeddings.append(response.embedding.values)
+        else:
+            raise RuntimeError(
+                f"Unexpected embedding response: {response}"
+            )
 
     return embeddings
