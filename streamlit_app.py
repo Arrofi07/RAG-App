@@ -66,6 +66,7 @@ if uploaded_file is not None:
         else:
             st.error(response.text)
 
+
 # --------------------------------------------------
 # Ask Questions
 # --------------------------------------------------
@@ -79,10 +80,17 @@ question = st.text_input(
 )
 
 top_k = st.slider(
-    "Top K",
+    "Top K (chunks sent to the LLM, after reranking)",
     min_value=1,
     max_value=20,
     value=5,
+)
+
+fetch_k = st.slider(
+    "Fetch K (candidates pulled from vector search, before reranking)",
+    min_value=top_k,
+    max_value=50,
+    value=30,
 )
 
 if st.button("Ask"):
@@ -99,6 +107,7 @@ if st.button("Ask"):
                 json={
                     "question": question,
                     "top_k": top_k,
+                    "fetch_k": fetch_k,
                 },
             )
 
@@ -118,6 +127,22 @@ if st.button("Ask"):
 
                 for src in sources:
                     st.write(f"- {src}")
+
+            matches = result.get("matches", [])
+
+            if matches:
+
+                with st.expander(
+                    f"Show the {len(matches)} chunks sent to the LLM "
+                    "(with vector vs. rerank scores)"
+                ):
+                    for i, m in enumerate(matches, start=1):
+                        st.markdown(
+                            f"**#{i}** — *{m.get('source', '')}* "
+                            f"&nbsp;&nbsp; vector: `{m.get('vector_score'):.3f}` "
+                            f"&nbsp;&nbsp; rerank: `{m.get('rerank_score'):.3f}`"
+                        )
+                        st.caption(m.get("text", "")[:400])
 
         else:
 

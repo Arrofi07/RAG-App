@@ -3,28 +3,47 @@
 import os
 from dotenv import load_dotenv
 
-from google import genai
+from sentence_transformers import SentenceTransformer
 from llama_index.readers.file import PDFReader
 from llama_index.core.node_parser import SentenceSplitter
 
 load_dotenv()
 
 # -------------------------
-# Gemini Client
+# Local embedding model
 # -------------------------
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Multilingual (handles the German PDF) and pairs naturally with the
+# BAAI/bge-reranker-v2-m3 reranker -- both are BAAI/BGE models designed to
+# work together. Runs fully locally: no API key, no rate limits, no
+# per-token cost. ~2.3GB download on first use.
+EMBED_MODEL_NAME = os.getenv("LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set.")
+# Output dimensionality of BAAI/bge-small-en-v1.5's dense embeddings.
+# IMPORTANT: this must match the `dim` your Qdrant collection was created
+# with. If you're switching from the old Gemini embeddings (3072-dim),
+# you must recreate the Qdrant collection and re-ingest every document --
+# embeddings from different models are never compatible, even when sizes
+# happen to match.
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+_embed_model: SentenceTransformer | None = None
 
-# Gemini embedding model
-EMBED_MODEL = "gemini-embedding-001"
 
-# Dimension used by your Qdrant collection
-EMBED_DIM = 3072
+def _get_embed_model() -> SentenceTransformer:
+    """Lazily load the embedding model so importing this module stays cheap."""
+    global _embed_model
+
+    if _embed_model is None:
+        _embed_model = SentenceTransformer(
+            EMBED_MODEL_NAME,
+            device="cpu",
+            )
+
+    return _embed_model
+
+def get_embed_dim() -> int:
+    """Return the dimensionality of the embedding model's output vectors."""
+    return _get_embed_model().get_sentence_embedding_dimension()
 
 # -------------------------
 # Text splitter
@@ -34,6 +53,7 @@ splitter = SentenceSplitter(
     chunk_size=1000,
     chunk_overlap=200,
 )
+
 
 # -------------------------
 # Load PDF and split
@@ -63,22 +83,26 @@ def load_and_chunk_pdf(path: str) -> list[str]:
 # -------------------------
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
-    embeddings = []
+    """
+    Embed a list of texts locally using BAAI/bge-small-en-v1.5.
 
-    for text in texts:
-        response = client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=text,
-        )
+    No API calls and no rate limits -- sentence-transformers handles
+    batching internally, so this scales to large documents without the
+    429 issues the Gemini API version had. bge-small-en-v1.5 doesn't need a special
+    instruction prefix for queries (unlike some other BGE models), so the
+    same call works for both document chunks and user questions.
+    """
 
-        # SDK versions expose either `embeddings` or `embedding`
-        if hasattr(response, "embeddings"):
-            embeddings.append(response.embeddings[0].values)
-        elif hasattr(response, "embedding"):
-            embeddings.append(response.embedding.values)
-        else:
-            raise RuntimeError(
-                f"Unexpected embedding response: {response}"
-            )
+    if not texts:
+        return []
 
-    return embeddings
+    model = _get_embed_model()
+
+    embeddings = model.encode(
+        texts,
+        batch_size=8,
+        normalize_embeddings=True,  # so cosine similarity == dot product
+        show_progress_bar=False,
+    )
+
+    return embeddings.tolist()

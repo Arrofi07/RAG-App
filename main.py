@@ -10,8 +10,11 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from google import genai
 
-from data_loader import load_and_chunk_pdf, embed_texts
+from data_loader import load_and_chunk_pdf, embed_texts, get_embed_dim
 from vector_db import QdrantStorage
+from reranker import rerank
+
+from datetime import datetime
 
 load_dotenv()
 
@@ -20,6 +23,8 @@ load_dotenv()
 # -------------------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+EMBED_DIM = get_embed_dim()
 
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is not set.")
@@ -31,16 +36,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
-store = QdrantStorage()
+store = QdrantStorage(dim=EMBED_DIM)
 
 
 # -------------------------
 # Request Model
 # -------------------------
 
+from typing import Optional
+
 class QueryRequest(BaseModel):
     question: str
     top_k: int = 5
+    fetch_k: int = 30
+    filename: Optional[str] = None
 
 
 # -------------------------
@@ -102,6 +111,10 @@ async def ingest_pdf(file: UploadFile = File(...)):
             {
                 "source": source_id,
                 "text": chunks[i],
+                "filename": source_id,
+                "uploaded_at": datetime.utcnow().isoformat(),
+                "document_type": "pdf",
+                "chunk_id": i,
             }
             for i in range(len(chunks))
         ]
@@ -138,13 +151,27 @@ def query(req: QueryRequest):
 
     question_vector = embed_texts([question])[0]
 
-    result = store.search(
-        question_vector,
-        top_k=req.top_k,
+    # Stage 1: cheap, wide dense retrieval (e.g. top 30 candidates).
+    # Vector search is fast but approximate — it compares the query's
+    # embedding to each chunk's embedding independently, so it sometimes
+    # ranks loosely-related chunks above more relevant ones.
+    candidates = store.search_candidates(
+        query_vector=question_vector,
+        fetch_k=req.fetch_k,
+        filename=req.filename,
     )
 
-    contexts = result["contexts"]
-    sources = result["sources"]
+    # Stage 2: precise, narrow reranking down to top_k.
+    # The cross-encoder reads (question, chunk) together, so it catches
+    # relevance that the vector search alone misses.
+    reranked = rerank(question, candidates, top_k=req.top_k)
+
+    contexts = [c["text"] for c in reranked]
+
+    sources = []
+    for c in reranked:
+        if c["source"] and c["source"] not in sources:
+            sources.append(c["source"])
 
     context_block = "\n\n".join(
         f"- {c}" for c in contexts
@@ -165,11 +192,42 @@ Question:
 
 {question}
 """
+    print("=" * 80)
+    print("QUESTION:")
+    print(question)
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-    )
+    print("\nNUM CANDIDATES:", len(candidates))
+    print("NUM RERANKED:", len(reranked))
+
+    print("\nSOURCES:")
+    print(sources)
+
+    print("\nPROMPT LENGTH:")
+    print(len(prompt))
+    print("=" * 80)
+
+    MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+
+    response = None
+
+    for model_name in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            break
+        except Exception as e:
+            print(f"{model_name} failed: {e}")
+
+    if response is None:
+        raise HTTPException(
+            status_code=503,
+            detail="All LLM backends unavailable."
+        )
 
     answer = ""
 
@@ -180,4 +238,13 @@ Question:
         "answer": answer,
         "sources": sources,
         "num_contexts": len(contexts),
+        "matches": [
+            {
+                "text": c["text"],
+                "source": c["source"],
+                "vector_score": c.get("vector_score"),
+                "rerank_score": c.get("rerank_score"),
+            }
+            for c in reranked
+        ],
     }
