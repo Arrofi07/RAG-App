@@ -1,53 +1,40 @@
 # custom_types.py
-#
-# All shared Pydantic models.  Import from here rather than defining inline
-# in main.py so both the API and tests share a single source of truth.
 
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Optional, Literal
+from pydantic import BaseModel
 
 
 # ---------------------------------------------------------------------------
-# Metadata filter — used in QueryRequest to narrow retrieval to a subset of
-# the collection.  Every field is optional; only non-None fields are applied.
+# Conversation
+# ---------------------------------------------------------------------------
+
+class ChatMessage(BaseModel):
+    """A single turn in the conversation history."""
+    role:    Literal["user", "assistant"]
+    content: str
+
+
+# ---------------------------------------------------------------------------
+# Metadata filter
 # ---------------------------------------------------------------------------
 
 class MetaFilter(BaseModel):
-    """
-    Filter chunks by payload metadata before vector search.
-
-    Qdrant evaluates ALL supplied conditions with AND logic (Qdrant `must`).
-    Fields left as None are ignored — they do not restrict results.
-
-    Examples
-    --------
-    # Only chunks from a specific file:
-    MetaFilter(filename="report_q4.pdf")
-
-    # All annual reports from 2022–2024:
-    MetaFilter(category="annual_report", year_from=2022, year_to=2024)
-
-    # Any document tagged "finance" OR "budget":
-    MetaFilter(tags=["finance", "budget"])
-    """
-
-    filename:    Optional[str]       = None
-    category:    Optional[str]       = None
-    author:      Optional[str]       = None
-    year_from:   Optional[int]       = None  # inclusive lower bound on `year`
-    year_to:     Optional[int]       = None  # inclusive upper bound on `year`
-    tags:        Optional[list[str]] = None  # match chunks that have ANY of these tags
+    filename:  Optional[str]       = None
+    category:  Optional[str]       = None
+    author:    Optional[str]       = None
+    year_from: Optional[int]       = None
+    year_to:   Optional[int]       = None
+    tags:      Optional[list[str]] = None
 
 
 # ---------------------------------------------------------------------------
-# API response shapes — wired into FastAPI as response_model so the OpenAPI
-# docs stay accurate and responses are validated on the way out.
+# API response shapes
 # ---------------------------------------------------------------------------
 
 class IngestResult(BaseModel):
-    success:  bool
-    source:   str
-    chunks:   int
+    success: bool
+    source:  str
+    chunks:  int
 
 
 class DocumentListResult(BaseModel):
@@ -55,16 +42,17 @@ class DocumentListResult(BaseModel):
 
 
 class MatchItem(BaseModel):
-    text:          str
-    source:        str
-    rrf_score:     Optional[float] = None
-    vector_score:  Optional[float] = None
-    rerank_score:  Optional[float] = None
+    text:         str
+    source:       str
+    rrf_score:    Optional[float] = None
+    vector_score: Optional[float] = None
+    rerank_score: Optional[float] = None
 
 
 class QueryResult(BaseModel):
-    answer:          str
-    sources:         list[str]
-    num_contexts:    int
-    retrieval_mode:  str
-    matches:         list[MatchItem]
+    answer:            str
+    sources:           list[str]
+    num_contexts:      int
+    retrieval_mode:    str
+    rewritten_question: Optional[str] = None   # None when history is empty
+    matches:           list[MatchItem]

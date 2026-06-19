@@ -12,15 +12,24 @@ load_dotenv()
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
 st.set_page_config(
-    page_title="PDF RAG",
-    page_icon="📄",
+    page_title="AI Advisor for Studying in Germany",
+    page_icon="🤖",
     layout="wide",
 )
 
-st.title("📄 PDF RAG Assistant")
+# ------------------------------------------------------------------
+# Session state initialisation
+# ------------------------------------------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []   # list of {"role": str, "content": str}
+
+if "debug_info" not in st.session_state:
+    st.session_state.debug_info = []  # parallel list, one entry per assistant turn
+
 
 # ------------------------------------------------------------------
-# Helper — fetch document metadata once per session, cache it
+# Helper
 # ------------------------------------------------------------------
 
 @st.cache_data(ttl=30)
@@ -34,223 +43,200 @@ def fetch_document_metadata() -> list[dict]:
     return []
 
 
-# ------------------------------------------------------------------
-# Layout: sidebar for filters, main column for upload + Q&A
-# ------------------------------------------------------------------
-
-sidebar = st.sidebar
-main    = st
-
 # ==================================================================
-# SIDEBAR — metadata filters
+# SIDEBAR
 # ==================================================================
 
-sidebar.header("🔎 Search Filters")
-sidebar.caption(
-    "Narrow retrieval to a subset of your documents. "
-    "Leave blank to search all."
-)
+with st.sidebar:
+    st.header("📄 Documents")
 
-docs_meta  = fetch_document_metadata()
-filenames  = sorted({d["filename"] for d in docs_meta if d.get("filename")})
-categories = sorted({d["category"] for d in docs_meta if d.get("category")})
-authors    = sorted({d["author"]   for d in docs_meta if d.get("author")})
-years      = sorted({d["year"]     for d in docs_meta if d.get("year")})
-all_tags   = sorted({
-    tag
-    for d in docs_meta
-    for tag in (d.get("tags") or [])
-})
+    # --- Upload ---
+    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 
-filter_filename = sidebar.selectbox(
-    "📄 Filename",
-    options=["(all)"] + filenames,
-)
+    if uploaded_file:
+        with st.expander("📝 Metadata (optional)"):
+            meta_category = st.text_input("Category", placeholder="e.g. report, contract")
+            meta_author   = st.text_input("Author",   placeholder="e.g. Alice Smith")
+            meta_year     = st.number_input("Year", min_value=1900, max_value=2100,
+                                            value=None, placeholder="e.g. 2024")
+            meta_tags     = st.text_input("Tags (comma-separated)",
+                                          placeholder="e.g. finance, Q4")
 
-filter_category = sidebar.selectbox(
-    "🗂 Category",
-    options=["(all)"] + categories,
-)
+        if st.button("⬆️ Ingest", use_container_width=True):
+            uploads_dir = Path("uploads")
+            uploads_dir.mkdir(exist_ok=True)
+            fp = uploads_dir / uploaded_file.name
 
-filter_author = sidebar.selectbox(
-    "✍️ Author",
-    options=["(all)"] + authors,
-)
+            with open(fp, "wb") as f:
+                f.write(uploaded_file.getbuffer())
 
-filter_tags = sidebar.multiselect(
-    "🏷 Tags  (match ANY)",
-    options=all_tags,
-)
+            with st.spinner("Ingesting…"):
+                with open(fp, "rb") as f:
+                    form_data = {
+                        "category": meta_category or "",
+                        "author":   meta_author   or "",
+                        "tags":     meta_tags     or "",
+                    }
+                    if meta_year:
+                        form_data["year"] = str(int(meta_year))
 
-year_range = None
-if years:
-    year_min, year_max = int(min(years)), int(max(years))
-    if year_min != year_max:
-        year_range = sidebar.slider(
-            "📅 Year range",
-            min_value=year_min,
-            max_value=year_max,
-            value=(year_min, year_max),
+                    resp = requests.post(
+                        f"{API_BASE}/ingest",
+                        files={"file": (uploaded_file.name, f, "application/pdf")},
+                        data=form_data,
+                    )
+
+            if resp.ok:
+                res = resp.json()
+                st.success(f"✅ {res['chunks']} chunks from `{res['source']}`")
+                st.cache_data.clear()
+            else:
+                st.error(resp.text)
+
+    st.divider()
+
+    # --- Ingested documents ---
+    docs_meta = fetch_document_metadata()
+
+    with st.expander(f"📚 Source Documents ({len(docs_meta)})", expanded=False):
+        if docs_meta:
+            for d in docs_meta:
+                tags_str = ", ".join(d.get("tags") or []) or "—"
+                st.markdown(
+                    f"**{d['filename']}**  \n"
+                    f"`{d.get('category') or '—'}` | "
+                    f"`{d.get('author') or '—'}` | "
+                    f"`{d.get('year') or '—'}` | "
+                    f"tags: `{tags_str}`"
+                )
+        else:
+            st.caption("No documents yet.")
+
+    st.divider()
+
+    # --- Search filters ---
+    st.header("🔎 Filters")
+
+    filenames  = sorted({d["filename"] for d in docs_meta if d.get("filename")})
+    categories = sorted({d["category"] for d in docs_meta if d.get("category")})
+    authors    = sorted({d["author"]   for d in docs_meta if d.get("author")})
+    years      = sorted({d["year"]     for d in docs_meta if d.get("year")})
+    all_tags   = sorted({t for d in docs_meta for t in (d.get("tags") or [])})
+
+    f_filename = st.selectbox("📄 File",     ["all"] + filenames)
+    f_category = st.selectbox("🗂 Category", ["all"] + categories)
+    f_author   = st.selectbox("✍️ Author",   ["all"] + authors)
+    f_tags     = st.multiselect("🏷 Tags (match any)", all_tags)
+
+    year_range = None
+    if len(years) >= 2:
+        year_range = st.slider(
+            "📅 Year",
+            min_value=int(min(years)), max_value=int(max(years)),
+            value=(int(min(years)), int(max(years))),
         )
-    else:
-        sidebar.caption(f"📅 Only one year in collection: {year_min}")
-        year_range = (year_min, year_max)
 
-# Build the filters dict sent to the API (None → omit → ignored server-side)
-active_filters = {}
-if filter_filename != "(all)":
-    active_filters["filename"] = filter_filename
-if filter_category != "(all)":
-    active_filters["category"] = filter_category
-if filter_author != "(all)":
-    active_filters["author"] = filter_author
-if filter_tags:
-    active_filters["tags"] = filter_tags
-if year_range and years:
-    if year_range[0] != int(min(years)) or year_range[1] != int(max(years)):
-        active_filters["year_from"] = year_range[0]
-        active_filters["year_to"]   = year_range[1]
+    active_filters: dict = {}
+    if f_filename != "all":   active_filters["filename"] = f_filename
+    if f_category != "all":   active_filters["category"] = f_category
+    if f_author   != "all":   active_filters["author"]   = f_author
+    if f_tags:                  active_filters["tags"]      = f_tags
+    if year_range and len(years) >= 2:
+        if year_range != (int(min(years)), int(max(years))):
+            active_filters["year_from"] = year_range[0]
+            active_filters["year_to"]   = year_range[1]
 
-if active_filters:
-    sidebar.success(f"Active filters: {list(active_filters.keys())}")
-else:
-    sidebar.info("No filters — searching all documents.")
+    if active_filters:
+        st.success(f"Filtering by: {', '.join(active_filters)}")
 
-sidebar.divider()
+    st.divider()
+
+    # --- Retrieval settings ---
+    st.header("⚙️ Settings")
+
+    top_k = st.slider("Top K (→ LLM)", min_value=1, max_value=20, value=5)
+    fetch_k = st.slider("Fetch K (pre-rerank)", min_value=5, max_value=50, value=30)
+    use_hybrid = st.toggle("Hybrid search", value=True,
+                           help="Dense + sparse → RRF. OFF = dense only.")
+    show_debug = st.toggle("Show debug info", value=False,
+                           help="Show rewritten question and chunk scores.")
+
+    if st.button("🗑️ Clear conversation", use_container_width=True):
+        st.session_state.messages   = []
+        st.session_state.debug_info = []
+        st.rerun()
+
 
 # ==================================================================
-# MAIN — Upload
+# MAIN — chat interface
 # ==================================================================
 
-main.header("📤 Upload a PDF")
+st.title("🤖 AI Advisor for Studying in Germany")
 
-uploaded_file = main.file_uploader("Choose a PDF", type=["pdf"])
+if not st.session_state.messages:
+    st.caption("Upload a PDF in the sidebar, then start chatting below.")
 
-if uploaded_file is not None:
+# Render existing conversation
+for i, msg in enumerate(st.session_state.messages):
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-    with main.expander("📝 Optional document metadata", expanded=True):
-        m_col1, m_col2 = main.columns(2)
+    # Debug panel after each assistant turn
+    if msg["role"] == "assistant" and show_debug:
+        turn_idx = sum(
+            1 for m in st.session_state.messages[:i+1] if m["role"] == "assistant"
+        ) - 1
 
-        with m_col1:
-            meta_category = main.text_input(
-                "Category",
-                placeholder="e.g. annual_report, contract, manual",
-            )
-            meta_author = main.text_input(
-                "Author",
-                placeholder="e.g. Alice Smith",
-            )
+        if turn_idx < len(st.session_state.debug_info):
+            info = st.session_state.debug_info[turn_idx]
 
-        with m_col2:
-            meta_year = main.number_input(
-                "Year",
-                min_value=1900,
-                max_value=2100,
-                value=None,
-                placeholder="e.g. 2024",
-            )
-            meta_tags = main.text_input(
-                "Tags  (comma-separated)",
-                placeholder="e.g. finance, budget, Q4",
-            )
+            with st.expander("🔍 Debug info for this answer"):
 
-    if main.button("⬆️ Ingest PDF"):
+                if info.get("rewritten_question"):
+                    st.info(f"**Query rewritten to:** {info['rewritten_question']}")
 
-        uploads_dir = Path("uploads")
-        uploads_dir.mkdir(exist_ok=True)
-        file_path = uploads_dir / uploaded_file.name
-
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        with main.spinner("Embedding (dense + sparse) and storing…"):
-
-            with open(file_path, "rb") as f:
-                form_data = {
-                    "category": (None, meta_category or ""),
-                    "author":   (None, meta_author   or ""),
-                    "tags":     (None, meta_tags      or ""),
-                }
-                if meta_year:
-                    form_data["year"] = (None, str(int(meta_year)))
-
-                response = requests.post(
-                    f"{API_BASE}/ingest",
-                    files={"file": (uploaded_file.name, f, "application/pdf")},
-                    data={k: v[1] for k, v in form_data.items()},
+                st.caption(
+                    f"Mode: **{info.get('retrieval_mode', '?')}** | "
+                    f"filters: **{list(active_filters.keys()) or 'none'}** | "
+                    f"sources: {', '.join(info.get('sources', []))}"
                 )
 
-        if response.ok:
-            result = response.json()
-            main.success(
-                f"✅ Ingested **{result['chunks']}** chunks from `{result['source']}`"
-            )
-            st.cache_data.clear()   # refresh the sidebar filter dropdowns
-        else:
-            main.error(response.text)
+                for j, m in enumerate(info.get("matches", []), 1):
+                    if m.get("rrf_score") is not None:
+                        score = f"RRF `{m['rrf_score']:.4f}`"
+                    elif m.get("vector_score") is not None:
+                        score = f"cosine `{m['vector_score']:.3f}`"
+                    else:
+                        score = "—"
 
-# ==================================================================
-# MAIN — Ingested documents
-# ==================================================================
+                    rerank_s = (
+                        f"`{m['rerank_score']:.3f}`"
+                        if m.get("rerank_score") is not None else "—"
+                    )
 
-main.divider()
+                    st.markdown(
+                        f"**#{j}** *{m.get('source','')}* — "
+                        f"{score} → rerank {rerank_s}"
+                    )
+                    st.caption(m.get("text", "")[:300])
 
-with main.expander("📚 Ingested documents"):
-    if docs_meta:
-        for d in docs_meta:
-            tags_str = ", ".join(d.get("tags") or []) or "—"
-            main.markdown(
-                f"**{d['filename']}**  "
-                f"| category: `{d.get('category') or '—'}`  "
-                f"| author: `{d.get('author') or '—'}`  "
-                f"| year: `{d.get('year') or '—'}`  "
-                f"| tags: `{tags_str}`"
-            )
-    else:
-        main.caption("No documents ingested yet.")
+# Chat input (sticks to bottom of page)
+if prompt := st.chat_input("Ask something about your documents…"):
 
-# ==================================================================
-# MAIN — Ask
-# ==================================================================
+    # Show the user message immediately
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
-main.divider()
-main.header("💬 Ask a Question")
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-question = main.text_input("Question")
-
-q_col1, q_col2 = main.columns(2)
-
-with q_col1:
-    top_k = main.slider(
-        "Top K (chunks → LLM, after reranking)",
-        min_value=1, max_value=20, value=5,
-    )
-
-with q_col2:
-    fetch_k = main.slider(
-        "Fetch K (candidates before reranking)",
-        min_value=max(top_k, 5), max_value=50, value=30,
-    )
-
-use_hybrid = main.toggle(
-    "Hybrid search (dense + sparse → RRF)",
-    value=True,
-    help="ON: combines semantic and keyword retrieval. OFF: dense only.",
-)
-
-if main.button("Ask ▶", type="primary"):
-
-    if not question.strip():
-        main.warning("Please enter a question.")
-
-    else:
-        mode_label = "hybrid" if use_hybrid else "dense-only"
-
-        with main.spinner(f"Retrieving ({mode_label}), reranking, generating…"):
-            response = requests.post(
+    # Call the API
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking…"):
+            resp = requests.post(
                 f"{API_BASE}/query",
                 json={
-                    "question":   question,
+                    "question":   prompt,
+                    "history":    st.session_state.messages[:-1],  # exclude current turn
                     "top_k":      top_k,
                     "fetch_k":    fetch_k,
                     "use_hybrid": use_hybrid,
@@ -258,47 +244,30 @@ if main.button("Ask ▶", type="primary"):
                 },
             )
 
-        if response.ok:
-            result = response.json()
+        if resp.ok:
+            result = resp.json()
+            answer = result.get("answer", "")
 
-            main.subheader("Answer")
-            main.write(result.get("answer", ""))
+            st.markdown(answer)
 
+            # Save assistant turn
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+            # Save debug info for this turn
+            st.session_state.debug_info.append({
+                "rewritten_question": result.get("rewritten_question"),
+                "retrieval_mode":     result.get("retrieval_mode"),
+                "sources":            result.get("sources", []),
+                "matches":            result.get("matches", []),
+            })
+
+            # Inline source attribution under the answer
             sources = result.get("sources", [])
             if sources:
-                main.subheader("Sources")
-                for src in sources:
-                    main.write(f"- {src}")
-
-            used_mode = result.get("retrieval_mode", "?")
-            main.caption(
-                f"Mode: **{used_mode}** | "
-                f"filters: **{list(active_filters.keys()) or 'none'}** | "
-                f"→ reranked to top {top_k}"
-            )
-
-            matches = result.get("matches", [])
-            if matches:
-                with main.expander(f"🔍 {len(matches)} chunks sent to LLM"):
-                    for i, m in enumerate(matches, start=1):
-
-                        if m.get("rrf_score") is not None:
-                            ret_score = f"RRF `{m['rrf_score']:.4f}`"
-                        elif m.get("vector_score") is not None:
-                            ret_score = f"cosine `{m['vector_score']:.3f}`"
-                        else:
-                            ret_score = "—"
-
-                        rerank_score = (
-                            f"`{m['rerank_score']:.3f}`"
-                            if m.get("rerank_score") is not None else "—"
-                        )
-
-                        main.markdown(
-                            f"**#{i}** — *{m.get('source', '')}*  \n"
-                            f"retrieval: {ret_score} &nbsp;&nbsp; rerank: {rerank_score}"
-                        )
-                        main.caption(m.get("text", "")[:400])
+                st.caption("Sources: " + " · ".join(f"`{s}`" for s in sources))
 
         else:
-            main.error(response.text)
+            error_msg = f"Error: {resp.text}"
+            st.error(error_msg)
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            st.session_state.debug_info.append({})
