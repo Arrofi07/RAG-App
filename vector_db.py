@@ -14,37 +14,34 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
+    Range,
     Prefetch,
     FusionQuery,
     Fusion,
-    NamedVector,
-    NamedSparseVector,
 )
 
-from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-from data_loader import get_embed_dim
+from custom_types import MetaFilter
 
 load_dotenv()
 
-EMBED_DIM = get_embed_dim()
 
 class QdrantStorage:
     """
-    Qdrant wrapper that stores both dense and sparse vectors per chunk,
+    Qdrant wrapper storing both dense and sparse vectors per chunk,
     enabling hybrid (dense + BM25-style sparse) retrieval with built-in
-    Reciprocal Rank Fusion.
- 
+    Reciprocal Rank Fusion, and metadata filtering on arbitrary payload fields.
+
     Collection layout
     -----------------
     named dense vector  → "dense"   (1024-dim, Cosine)
     named sparse vector → "sparse"  (SparseVectorParams)
- 
-    This is a breaking change from the flat-vector layout used in v1/v2.
-    If an existing collection is detected with the wrong structure, a clear
-    ValueError is raised so the user knows to recreate it.
+
+    Payload fields available for MetaFilter
+    ----------------------------------------
+    filename, category, author, year, tags, document_type, uploaded_at
     """
- 
+
     DENSE_NAME  = "dense"
     SPARSE_NAME = "sparse"
 
@@ -52,47 +49,42 @@ class QdrantStorage:
         self,
         url: str | None = None,
         collection: str = "docs",
-        dim: int = EMBED_DIM,
+        dim: int = 1024,
     ):
         self.url = url or os.getenv("QDRANT_URL", "http://localhost:6333")
         self.collection = collection
         self.dim = dim
- 
+
         self.client = QdrantClient(url=self.url, timeout=30)
- 
+
         if self.client.collection_exists(collection_name=self.collection):
             self._validate_existing_collection()
         else:
             self._create_collection()
 
+    # ------------------------------------------------------------------
+    # Collection management
+    # ------------------------------------------------------------------
+
     def _validate_existing_collection(self) -> None:
-        """
-        Verify the existing collection has the expected named-vector structure.
-        Raises ValueError with a clear migration message if it doesn't.
-        """
         info = self.client.get_collection(collection_name=self.collection)
         vectors_config = info.config.params.vectors
- 
-        # Flat vector config (pre-hybrid) → wrong structure
+
         if not isinstance(vectors_config, dict):
             raise ValueError(
-                f"Collection '{self.collection}' uses a flat (non-named) "
-                f"vector layout from an older version of this app. "
-                f"Hybrid search requires a named-vector collection. "
-                f"Please delete the collection and re-ingest your documents:\n"
+                f"Collection '{self.collection}' uses a flat vector layout "
+                f"from an older version. Delete it and re-ingest:\n"
                 f"  curl -X DELETE http://localhost:6333/collections/{self.collection}"
             )
- 
-        # Named vector dict but wrong dense dimension
+
         dense_cfg = vectors_config.get(self.DENSE_NAME)
         if dense_cfg is None or dense_cfg.size != self.dim:
-            existing_dim = dense_cfg.size if dense_cfg else "unknown"
+            existing = dense_cfg.size if dense_cfg else "unknown"
             raise ValueError(
-                f"Collection '{self.collection}' has a '{self.DENSE_NAME}' "
-                f"vector of size {existing_dim}, expected {self.dim}. "
-                f"Delete the collection and re-ingest."
+                f"Collection '{self.collection}' has '{self.DENSE_NAME}' "
+                f"size={existing}, expected {self.dim}. Delete and re-ingest."
             )
- 
+
     def _create_collection(self) -> None:
         self.client.create_collection(
             collection_name=self.collection,
@@ -112,12 +104,12 @@ class QdrantStorage:
     # ------------------------------------------------------------------
     # Write
     # ------------------------------------------------------------------
- 
+
     def upsert(
         self,
         ids: list[str],
         dense_vectors: list[list[float]],
-        sparse_vectors: list[dict],   # each: {"indices": [...], "values": [...]}
+        sparse_vectors: list[dict],
         payloads: list[dict],
     ) -> None:
         points = [
@@ -134,28 +126,71 @@ class QdrantStorage:
             )
             for i in range(len(ids))
         ]
- 
-        self.client.upsert(         
+
+        self.client.upsert(
             collection_name=self.collection,
             points=points,
         )
 
     # ------------------------------------------------------------------
+    # Filter building
+    # ------------------------------------------------------------------
+
+    def _build_filter(self, meta: MetaFilter | None) -> Filter | None:
+        """
+        Translate a MetaFilter into a Qdrant Filter with AND logic.
+
+        Each non-None field becomes one `must` clause:
+          - filename / category / author  → exact MatchValue
+          - tags                          → MatchAny  (chunk matches if it has ANY tag)
+          - year_from / year_to           → Range on the `year` integer field
+        """
+        if meta is None:
+            return None
+
+        must = []
+
+        if meta.filename:
+            must.append(FieldCondition(
+                key="filename",
+                match=MatchValue(value=meta.filename),
+            ))
+
+        if meta.category:
+            must.append(FieldCondition(
+                key="category",
+                match=MatchValue(value=meta.category),
+            ))
+
+        if meta.author:
+            must.append(FieldCondition(
+                key="author",
+                match=MatchValue(value=meta.author),
+            ))
+
+        if meta.tags:
+            # MatchAny: chunk matches if its `tags` payload list contains
+            # at least one of the requested tags.
+            must.append(FieldCondition(
+                key="tags",
+                match=MatchAny(any=meta.tags),
+            ))
+
+        if meta.year_from is not None or meta.year_to is not None:
+            must.append(FieldCondition(
+                key="year",
+                range=Range(
+                    gte=meta.year_from,  # None → no lower bound
+                    lte=meta.year_to,    # None → no upper bound
+                ),
+            ))
+
+        return Filter(must=must) if must else None
+
+    # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
- 
-    def _build_filter(self, filename: str | None) -> Filter | None:
-        if not filename:
-            return None
-        return Filter(
-            must=[
-                FieldCondition(
-                    key="filename",
-                    match=MatchValue(value=filename),
-                )
-            ]
-        )
- 
+
     def _points_to_candidates(
         self,
         points,
@@ -168,37 +203,29 @@ class QdrantStorage:
             if not text:
                 continue
             candidates.append({
-                "id":       str(r.id),
-                "text":     text,
-                "source":   payload.get("source", ""),
-                "page":     payload.get("page"),
-                score_key:  r.score,
+                "id":      str(r.id),
+                "text":    text,
+                "source":  payload.get("source", ""),
+                "page":    payload.get("page"),
+                score_key: r.score,
             })
         return candidates
- 
+
     def search_hybrid_candidates(
         self,
         dense_vector: list[float],
         sparse_vector: dict,
         fetch_k: int = 30,
-        filename: str | None = None,
+        meta: MetaFilter | None = None,
     ) -> list[dict]:
         """
-        Hybrid retrieval using Qdrant's built-in Reciprocal Rank Fusion.
- 
-        Internally, Qdrant runs two sub-searches in parallel:
-          1. Dense (cosine similarity on the 1024-dim vector)
-          2. Sparse (dot product on lexical BM25-style weights)
-        …then merges both ranked lists with RRF into a single ranked list.
- 
-        RRF score for a document d = Σ  1 / (rank_i(d) + k)
-        where rank_i(d) is d's rank in retrieval list i and k=60 by default.
-        It's parameter-free and robust to score-scale differences between
-        the two retrievers — no need to tune alpha/weights.
+        Hybrid retrieval: dense + sparse → server-side RRF fusion.
+
+        RRF score = Σ 1 / (rank_i + 60)  for each retrieval list i.
+        Parameter-free and robust to score-scale differences.
         """
- 
-        query_filter = self._build_filter(filename)
- 
+        query_filter = self._build_filter(meta)
+
         results = self.client.query_points(
             collection_name=self.collection,
             prefetch=[
@@ -222,20 +249,19 @@ class QdrantStorage:
             limit=fetch_k,
             with_payload=True,
         )
- 
+
         points = getattr(results, "points", results)
         return self._points_to_candidates(points, score_key="rrf_score")
- 
+
     def search_candidates(
         self,
         query_vector: list[float],
         fetch_k: int = 30,
-        filename: str | None = None,
+        meta: MetaFilter | None = None,
     ) -> list[dict]:
-        """Dense-only candidate retrieval (kept for fallback / ablation)."""
- 
-        query_filter = self._build_filter(filename)
- 
+        """Dense-only retrieval (ablation / fallback)."""
+        query_filter = self._build_filter(meta)
+
         results = self.client.query_points(
             collection_name=self.collection,
             query=query_vector,
@@ -244,22 +270,33 @@ class QdrantStorage:
             limit=fetch_k,
             query_filter=query_filter,
         )
- 
+
         points = getattr(results, "points", results)
         return self._points_to_candidates(points, score_key="vector_score")
- 
-    def list_documents(self) -> list[str]:
+
+    def list_documents(self) -> list[dict]:
+        """
+        Return all unique documents with their stored metadata.
+        Used by the UI to populate filter dropdowns.
+        """
         records, _ = self.client.scroll(
             collection_name=self.collection,
-            limit=100,
+            limit=1000,
             with_payload=True,
             with_vectors=False,
         )
- 
-        docs = set()
+
+        seen = {}
         for r in records:
             payload = r.payload or {}
-            if "filename" in payload:
-                docs.add(payload["filename"])
- 
-        return sorted(docs)
+            fname = payload.get("filename")
+            if fname and fname not in seen:
+                seen[fname] = {
+                    "filename": fname,
+                    "category": payload.get("category"),
+                    "author":   payload.get("author"),
+                    "year":     payload.get("year"),
+                    "tags":     payload.get("tags", []),
+                }
+
+        return sorted(seen.values(), key=lambda d: d["filename"])
