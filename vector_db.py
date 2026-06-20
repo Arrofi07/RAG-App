@@ -203,11 +203,16 @@ class QdrantStorage:
             if not text:
                 continue
             candidates.append({
-                "id":      str(r.id),
-                "text":    text,
-                "source":  payload.get("source", ""),
-                "page":    payload.get("page"),
-                score_key: r.score,
+                "id":              str(r.id),
+                "text":            text,
+                # Neighbor chunks stored at ingest — used for window expansion
+                "prev_chunk":      payload.get("prev_chunk", ""),
+                "next_chunk":      payload.get("next_chunk", ""),
+                # LLM-generated context prefix — None if not enriched at ingest
+                "context_prefix":  payload.get("context_prefix"),
+                "source":          payload.get("source", ""),
+                "page":            payload.get("page"),
+                score_key:         r.score,
             })
         return candidates
 

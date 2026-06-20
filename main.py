@@ -13,15 +13,17 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from google import genai
 
-from data_loader import load_and_chunk_pdf, embed, EMBED_DIM
+from data_loader import load_chunks, embed, EMBED_DIM
 from vector_db import QdrantStorage
 from reranker import rerank
+from context_builder import generate_chunk_context, build_contextual_text
 from custom_types import (
     ChatMessage,
     MetaFilter,
     IngestResult,
     DocumentListResult,
     QueryResult,
+    MatchItem,
 )
 
 load_dotenv()
@@ -34,34 +36,31 @@ log = logging.getLogger(__name__)
 # -------------------------
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY is not set.")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-app = FastAPI(title="RAG Chatbot API", version="5.0.0")
+app = FastAPI(title="RAG Chatbot API", version="6.0.0")
 
 store = QdrantStorage(dim=EMBED_DIM)
 
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
-
-# How many past turns to include in the prompt.
-# Older turns are dropped to avoid bloating the context window.
-MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "6"))
+GEMINI_MODELS      = ["gemini-2.5-flash", "gemini-2.0-flash"]
+MAX_HISTORY_TURNS  = int(os.getenv("MAX_HISTORY_TURNS", "6"))
 
 
 # -------------------------
-# Request models
+# Request model
 # -------------------------
 
 class QueryRequest(BaseModel):
-    question:   str
-    history:    list[ChatMessage] = []   # full conversation so far, oldest first
-    top_k:      int         = 5
-    fetch_k:    int         = 30
-    use_hybrid: bool        = True
-    filters:    MetaFilter  = MetaFilter()
+    question:            str
+    history:             list[ChatMessage] = []
+    top_k:               int        = 5
+    fetch_k:             int        = 30
+    use_hybrid:          bool       = True
+    use_window_expansion: bool      = True   # expand matched chunks with neighbors
+    filters:             MetaFilter = MetaFilter()
 
 
 # -------------------------
@@ -69,18 +68,13 @@ class QueryRequest(BaseModel):
 # -------------------------
 
 def _call_llm(prompt: str) -> str:
-    """Try each Gemini model in order, return the first successful response."""
     for model_name in GEMINI_MODELS:
         try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-            )
+            resp = client.models.generate_content(model=model_name, contents=prompt)
             if hasattr(resp, "text") and resp.text:
                 return resp.text.strip()
         except Exception as e:
             log.warning("%s failed: %s", model_name, e)
-
     raise HTTPException(status_code=503, detail="All LLM backends unavailable.")
 
 
@@ -89,25 +83,11 @@ def _call_llm(prompt: str) -> str:
 # -------------------------
 
 def _rewrite_question(question: str, history: list[ChatMessage]) -> str:
-    """
-    Use the LLM to turn a follow-up question into a fully self-contained one.
-
-    Why this matters: the embedding model has no memory — if the user asks
-    "what about Q4?" after a question about revenue, the vector search would
-    retrieve chunks about Q4 in general, not Q4 revenue. Rewriting first
-    gives the retriever a precise, context-rich query to work with.
-
-    When there is no history we skip the LLM call entirely and return the
-    original question unchanged.
-    """
     if not history:
         return question
 
-    # Build a compact transcript of the last N turns
-    recent = history[-(MAX_HISTORY_TURNS):]
-    transcript = "\n".join(
-        f"{m.role.upper()}: {m.content}" for m in recent
-    )
+    recent     = history[-(MAX_HISTORY_TURNS):]
+    transcript = "\n".join(f"{m.role.upper()}: {m.content}" for m in recent)
 
     prompt = f"""You are a query rewriter for a RAG system.
 
@@ -130,9 +110,37 @@ Rewritten question:"""
     try:
         return _call_llm(prompt)
     except Exception:
-        # If rewriting fails for any reason, fall back to the original
         log.warning("Query rewriting failed, using original question.")
         return question
+
+
+# -------------------------
+# Window expansion
+# -------------------------
+
+def _expand_with_window(candidates: list[dict]) -> list[dict]:
+    """
+    Expand each retrieved chunk with its stored neighbors.
+
+    Why this helps:
+      A chunk that perfectly answers a retrieval query may lack the
+      surrounding context the LLM needs to understand it — it might start
+      mid-sentence or reference something from the previous paragraph.
+      By prepending prev_chunk and appending next_chunk, the LLM receives
+      the full semantic window around the matched text.
+
+    The original `text` is preserved so the UI can still show what was
+    actually matched.  `text_sent_to_llm` holds the expanded version.
+
+    Deduplication: if two neighboring chunks both matched, their windows
+    would overlap.  We track seen chunk IDs and skip expansion for chunks
+    whose neighbors we've already included via another candidate.
+    """
+    for c in candidates:
+        parts = [p for p in [c.get("prev_chunk", ""), c["text"], c.get("next_chunk", "")] if p]
+        c["text_sent_to_llm"] = "\n\n".join(parts)
+
+    return candidates
 
 
 # -------------------------
@@ -141,7 +149,7 @@ Rewritten question:"""
 
 @app.get("/")
 def root():
-    return {"status": "running", "version": "5.0.0 — chatbot with memory"}
+    return {"status": "running", "version": "6.0.0 — context-aware retrieval"}
 
 
 # -------------------------
@@ -150,14 +158,35 @@ def root():
 
 @app.post("/ingest", response_model=IngestResult)
 async def ingest_pdf(
-    file:     UploadFile    = File(...),
-    category: Optional[str] = Form(None),
-    author:   Optional[str] = Form(None),
-    year:     Optional[int] = Form(None),
-    tags:     Optional[str] = Form(None),
+    file:              UploadFile    = File(...),
+    category:          Optional[str] = Form(None),
+    author:            Optional[str] = Form(None),
+    year:              Optional[int] = Form(None),
+    tags:              Optional[str] = Form(None),
+    use_contextual:    str           = Form("false"),  # "true" / "false"
 ):
+    """
+    Ingest a PDF with optional metadata and optional contextual enrichment.
+
+    use_contextual (bool, default false)
+    ─────────────────────────────────────
+    When true, an LLM call is made for every chunk to generate a short
+    context sentence describing where that chunk sits in the document.
+    That context is prepended to the chunk before embedding, so vector
+    search becomes context-aware rather than purely content-aware.
+
+    This adds ~1 LLM call per chunk to ingest time — for a 50-chunk PDF
+    expect roughly 50 extra fast LLM calls.  The quality improvement is
+    significant for documents where chunks are ambiguous without context
+    (tables, numbered lists, cross-references, etc.).
+
+    Chunks are always stored with prev_chunk / next_chunk neighbors
+    (used for window expansion at query time), regardless of this flag.
+    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    do_contextual = use_contextual.lower() in ("true", "1", "yes")
 
     tag_list = (
         [t.strip() for t in tags.split(",") if t.strip()]
@@ -170,14 +199,45 @@ async def ingest_pdf(
         pdf_path = tmp.name
 
     try:
-        chunks = load_and_chunk_pdf(pdf_path)
+        loaded     = load_chunks(pdf_path)
+        chunks     = loaded["chunks"]        # list of dicts with text, prev, next, page
+        full_text  = loaded["full_text"]     # entire doc text for context generation
 
         if not chunks:
             raise HTTPException(status_code=400, detail="No text found in PDF.")
 
-        embeddings  = embed(chunks)
-        source_id   = file.filename
+        source_id = file.filename
 
+        # ── Contextual enrichment ────────────────────────────────────────────
+        # For each chunk, optionally generate an LLM context prefix and
+        # build the enriched text that will be embedded.
+        texts_to_embed = []
+        contextual_texts = []
+
+        for i, chunk in enumerate(chunks):
+            if do_contextual:
+                log.info(
+                    "Generating context for chunk %d/%d from '%s'",
+                    i + 1, len(chunks), source_id,
+                )
+                ctx = generate_chunk_context(
+                    full_doc_text=full_text,
+                    chunk_text=chunk["text"],
+                    source=source_id,
+                    llm_fn=_call_llm,
+                )
+                enriched = build_contextual_text(ctx, chunk["text"])
+            else:
+                ctx      = ""
+                enriched = chunk["text"]
+
+            contextual_texts.append(ctx)
+            texts_to_embed.append(enriched)
+
+        # ── Embed ────────────────────────────────────────────────────────────
+        embeddings = embed(texts_to_embed)
+
+        # ── Build payloads ───────────────────────────────────────────────────
         ids = [
             str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source_id}:{i}"))
             for i in range(len(chunks))
@@ -185,16 +245,24 @@ async def ingest_pdf(
 
         payloads = [
             {
-                "source":        source_id,
-                "text":          chunks[i],
-                "filename":      source_id,
-                "chunk_id":      i,
-                "document_type": "pdf",
-                "uploaded_at":   datetime.utcnow().isoformat(),
-                "category":      category,
-                "author":        author,
-                "year":          year,
-                "tags":          tag_list,
+                # Core
+                "source":           source_id,
+                "text":             chunks[i]["text"],       # original, always shown
+                "prev_chunk":       chunks[i]["prev_chunk"],
+                "next_chunk":       chunks[i]["next_chunk"],
+                "chunk_index":      chunks[i]["chunk_index"],
+                "page":             chunks[i]["page"],
+                "filename":         source_id,
+                "document_type":    "pdf",
+                "uploaded_at":      datetime.utcnow().isoformat(),
+                # User metadata
+                "category":         category,
+                "author":           author,
+                "year":             year,
+                "tags":             tag_list,
+                # Context-aware fields
+                "contextual_text":  contextual_texts[i] or None,  # None if not enriched
+                "was_enriched":     do_contextual and bool(contextual_texts[i]),
             }
             for i in range(len(chunks))
         ]
@@ -207,11 +275,16 @@ async def ingest_pdf(
         )
 
         log.info(
-            "Ingested %d chunks from '%s' | category=%s author=%s year=%s tags=%s",
-            len(chunks), source_id, category, author, year, tag_list,
+            "Ingested %d chunks from '%s' | contextual=%s category=%s author=%s year=%s tags=%s",
+            len(chunks), source_id, do_contextual, category, author, year, tag_list,
         )
 
-        return IngestResult(success=True, source=source_id, chunks=len(chunks))
+        return IngestResult(
+            success=True,
+            source=source_id,
+            chunks=len(chunks),
+            contextual_enriched=do_contextual,
+        )
 
     finally:
         Path(pdf_path).unlink(missing_ok=True)
@@ -228,21 +301,18 @@ def query(req: QueryRequest):
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
-    # ── Stage 1: Query rewriting ─────────────────────────────────────────
-    # Resolve references to previous turns ("what about the second one?")
-    # into a standalone question before it hits the embedding model.
+    # ── Stage 1: Query rewriting ─────────────────────────────────────────────
     rewritten = _rewrite_question(question, req.history)
-
     if rewritten != question:
         log.info("Rewritten: '%s' → '%s'", question, rewritten)
 
-    # ── Stage 2: Hybrid retrieval ────────────────────────────────────────
+    # ── Stage 2: Hybrid retrieval ─────────────────────────────────────────────
     q_emb    = embed([rewritten])
     q_dense  = q_emb["dense"][0]
     q_sparse = q_emb["sparse"][0]
 
     if req.use_hybrid:
-        candidates = store.search_hybrid_candidates(
+        candidates     = store.search_hybrid_candidates(
             dense_vector=q_dense,
             sparse_vector=q_sparse,
             fetch_k=req.fetch_k,
@@ -250,33 +320,47 @@ def query(req: QueryRequest):
         )
         retrieval_mode = "hybrid"
     else:
-        candidates = store.search_candidates(
+        candidates     = store.search_candidates(
             query_vector=q_dense,
             fetch_k=req.fetch_k,
             meta=req.filters,
         )
         retrieval_mode = "dense"
 
-    # ── Stage 3: Rerank ──────────────────────────────────────────────────
+    # ── Stage 3: Rerank ───────────────────────────────────────────────────────
+    # Rerank on the original chunk text (not the expanded window) so the
+    # cross-encoder stays focused on the matched content, not the neighbors.
     reranked = rerank(rewritten, candidates, top_k=req.top_k)
 
-    contexts = [c["text"] for c in reranked]
+    # ── Stage 4: Window expansion ─────────────────────────────────────────────
+    # After reranking, expand each chunk with its stored neighbors.
+    # The LLM reads the expanded text; the UI shows the original match.
+    if req.use_window_expansion:
+        reranked = _expand_with_window(reranked)
+
+    window_expanded = req.use_window_expansion and any(
+        c.get("prev_chunk") or c.get("next_chunk") for c in reranked
+    )
+
+    # ── Stage 5: Generate ─────────────────────────────────────────────────────
+    # Use expanded text for the LLM if available, else raw chunk text.
+    llm_texts = [
+        c.get("text_sent_to_llm") or c["text"]
+        for c in reranked
+    ]
+
+    context_block = "\n\n".join(f"[{i+1}] {t}" for i, t in enumerate(llm_texts))
 
     sources = []
     for c in reranked:
         if c["source"] and c["source"] not in sources:
             sources.append(c["source"])
 
-    # ── Stage 4: Generate with history ───────────────────────────────────
-    context_block = "\n\n".join(f"[{i+1}] {c}" for i, c in enumerate(contexts))
-
-    # Include the last N turns of history so the LLM can produce coherent
-    # follow-up answers (e.g. "As I mentioned earlier..." or "Adding to the
-    # previous answer...").
     recent_history = req.history[-(MAX_HISTORY_TURNS):]
-    history_block = "\n".join(
-        f"{m.role.upper()}: {m.content}" for m in recent_history
-    ) if recent_history else ""
+    history_block  = (
+        "\n".join(f"{m.role.upper()}: {m.content}" for m in recent_history)
+        if recent_history else ""
+    )
 
     prompt = f"""You are a helpful assistant that answers questions based on document context.
 
@@ -300,17 +384,20 @@ Answer:"""
     return QueryResult(
         answer=answer,
         sources=sources,
-        num_contexts=len(contexts),
+        num_contexts=len(reranked),
         retrieval_mode=retrieval_mode,
         rewritten_question=rewritten if rewritten != question else None,
+        window_expanded=window_expanded,
         matches=[
-            {
-                "text":         c["text"],
-                "source":       c["source"],
-                "rrf_score":    c.get("rrf_score"),
-                "vector_score": c.get("vector_score"),
-                "rerank_score": c.get("rerank_score"),
-            }
+            MatchItem(
+                text=c["text"],
+                source=c["source"],
+                rrf_score=c.get("rrf_score"),
+                vector_score=c.get("vector_score"),
+                rerank_score=c.get("rerank_score"),
+                text_sent_to_llm=c.get("text_sent_to_llm"),
+                was_enriched=bool(c.get("contextual_text")),
+            )
             for c in reranked
         ],
     )

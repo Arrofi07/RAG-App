@@ -9,7 +9,6 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 
 class ChatMessage(BaseModel):
-    """A single turn in the conversation history."""
     role:    Literal["user", "assistant"]
     content: str
 
@@ -32,9 +31,10 @@ class MetaFilter(BaseModel):
 # ---------------------------------------------------------------------------
 
 class IngestResult(BaseModel):
-    success: bool
-    source:  str
-    chunks:  int
+    success:             bool
+    source:              str
+    chunks:              int
+    contextual_enriched: bool = False   # True when LLM context was generated
 
 
 class DocumentListResult(BaseModel):
@@ -42,17 +42,22 @@ class DocumentListResult(BaseModel):
 
 
 class MatchItem(BaseModel):
-    text:         str
-    source:       str
-    rrf_score:    Optional[float] = None
-    vector_score: Optional[float] = None
-    rerank_score: Optional[float] = None
+    text:              str
+    source:            str
+    rrf_score:         Optional[float] = None
+    vector_score:      Optional[float] = None
+    rerank_score:      Optional[float] = None
+    # What was actually sent to the LLM (may be expanded with neighbors)
+    text_sent_to_llm:  Optional[str]   = None
+    # Whether LLM-generated context prefix was prepended at embed time
+    was_enriched:      bool            = False
 
 
 class QueryResult(BaseModel):
-    answer:            str
-    sources:           list[str]
-    num_contexts:      int
-    retrieval_mode:    str
-    rewritten_question: Optional[str] = None   # None when history is empty
-    matches:           list[MatchItem]
+    answer:              str
+    sources:             list[str]
+    num_contexts:        int
+    retrieval_mode:      str
+    rewritten_question:  Optional[str]  = None
+    window_expanded:     bool           = False
+    matches:             list[MatchItem]
