@@ -6,9 +6,10 @@ dist/
 wheels/
 *.egg-info
 *.zip
+uploads/
+.DS_Store
+data
 
 # Virtual environments
 .venv
 .env
-uploads/
-.DS_Store
