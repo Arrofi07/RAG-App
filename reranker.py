@@ -1,23 +1,46 @@
 # reranker.py
 
+import os
+import logging
 from sentence_transformers import CrossEncoder
 
-# Multilingual cross-encoder reranker (works well on English + German content,
-# which matters since your test PDF is German). ~2.3GB, downloads on first run.
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+log = logging.getLogger(__name__)
+
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+
+# Use MPS on Apple Silicon, CUDA on NVIDIA, CPU otherwise.
+# Kept self-contained so reranker.py has no dependency on data_loader.py.
+def _detect_device() -> str:
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+DEVICE = os.getenv("RERANKER_DEVICE", _detect_device())
 
 _model: CrossEncoder | None = None
 
 
 def _get_model() -> CrossEncoder:
-    """Lazily load the cross-encoder so importing this module is cheap and
-    the (large) model only gets pulled into memory the first time it's used."""
     global _model
-
     if _model is None:
-        _model = CrossEncoder(RERANKER_MODEL, max_length=512)
-
+        log.info("Loading reranker '%s' on device='%s'…", RERANKER_MODEL, DEVICE)
+        _model = CrossEncoder(RERANKER_MODEL, max_length=512, device=DEVICE)
+        log.info("Reranker ready.")
     return _model
+
+
+def warmup() -> None:
+    """
+    Pre-load the reranker into memory at server startup so the first real
+    request doesn't pay the cold-start penalty (~7-10 s on CPU).
+    """
+    _get_model()
 
 
 def rerank(
@@ -28,39 +51,19 @@ def rerank(
     """
     Re-score and re-order retrieved candidates using a cross-encoder.
 
-    A cross-encoder reads the query and a candidate chunk together (instead
-    of comparing two separately-computed embeddings), which makes it much
-    more precise at judging relevance than the dense vector search alone —
-    at the cost of being too slow to run over the whole collection, which is
-    why it only runs on the top N candidates dense search already narrowed
-    down.
-
-    Args:
-        query: the user's question.
-        candidates: list of dicts with at least a "text" key, as returned
-            by QdrantStorage.search_candidates().
-        top_k: how many candidates to keep after reranking.
-
-    Returns:
-        The top_k candidates, sorted best-to-worst, each with a
-        "rerank_score" key added (float, higher = more relevant).
+    A cross-encoder reads the query and each candidate chunk together —
+    much more precise than comparing separate embeddings, but too slow to
+    run over the full collection, which is why it only sees the top-N
+    candidates that dense/sparse retrieval already narrowed down.
     """
-
     if not candidates:
         return []
 
-    model = _get_model()
-
-    pairs = [(query, c["text"]) for c in candidates]
+    model  = _get_model()
+    pairs  = [(query, c["text"]) for c in candidates]
     scores = model.predict(pairs)
 
     for candidate, score in zip(candidates, scores):
         candidate["rerank_score"] = float(score)
 
-    ranked = sorted(
-        candidates,
-        key=lambda c: c["rerank_score"],
-        reverse=True,
-    )
-
-    return ranked[:top_k]
+    return sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)[:top_k]

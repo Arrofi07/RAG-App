@@ -1,21 +1,30 @@
-# custom_types.py
+# custom_types.py  (v8.0.0)
+#
+# Shared Pydantic models for the FastAPI backend and Streamlit frontend.
+#
+# V8 CHANGES:
+# - QueryResult gets two new optional fields:
+#     intent          : which plan the agentic planner chose
+#     web_sources     : list of URLs found by the web search tool
+# - UniversityMatch  : new model for recommender output
+# - RecommendResult  : wrapper for the /recommend endpoint response
 
 from typing import Optional, Literal, Any
 from pydantic import BaseModel
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Conversation
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
     role:    Literal["user", "assistant"]
     content: str
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # User profile
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class UserProfile(BaseModel):
     """
@@ -39,9 +48,9 @@ class UserProfile(BaseModel):
     extra_notes:         Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Metadata filter
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Metadata filter (for RAG retrieval)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class MetaFilter(BaseModel):
     filename:  Optional[str]       = None
@@ -52,9 +61,9 @@ class MetaFilter(BaseModel):
     tags:      Optional[list[str]] = None
 
 
-# ---------------------------------------------------------------------------
-# API response shapes
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingest response
+# ─────────────────────────────────────────────────────────────────────────────
 
 class IngestResult(BaseModel):
     success:             bool
@@ -67,7 +76,18 @@ class DocumentListResult(BaseModel):
     documents: list[str]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Query response (RAG / planner)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WebSource(BaseModel):
+    """A single web search result citation."""
+    title: str = ""
+    url:   str = ""
+
+
 class MatchItem(BaseModel):
+    """One retrieved RAG chunk with its retrieval scores."""
     text:             str
     source:           str
     rrf_score:        Optional[float] = None
@@ -85,7 +105,50 @@ class QueryResult(BaseModel):
     rewritten_question: Optional[str] = None
     window_expanded:    bool          = False
     matches:            list[MatchItem]
+    # New v8 fields — optional so v7 clients still work
+    intent:             Optional[str]           = None  # planner intent used
+    web_sources:        Optional[list[WebSource]] = None  # live web citations
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# University recommender response
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UniversityMatch(BaseModel):
+    """
+    A single university recommendation from the hybrid recommender.
+    All fields except name/city are optional because some programs in the
+    seed data may not have every attribute filled in.
+    """
+    name:             str
+    short_name:       Optional[str]  = None
+    city:             str
+    state:            Optional[str]  = None
+    url:              Optional[str]  = None
+    degree_type:      Optional[str]  = None
+    field:            Optional[str]  = None
+    program_name:     Optional[str]  = None
+    language:         Optional[str]  = None
+    semester_fee_eur: Optional[int]  = None
+    german_required:  Optional[str]  = None
+    english_required: Optional[str]  = None
+    research_areas:   Optional[str]  = None
+    strengths:        Optional[str]  = None
+    winter_deadline:  Optional[str]  = None
+    summer_deadline:  Optional[str]  = None
+    match_score:      Optional[float] = None   # 0.0–1.0
+    match_reason:     Optional[str]  = None
+
+
+class RecommendResult(BaseModel):
+    universities:   list[UniversityMatch]
+    total_filtered: int   # how many passed SQL hard-filter before vector ranking
+    profile_used:   dict[str, Any]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# User / conversation metadata
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ConversationMeta(BaseModel):
     id:         str
