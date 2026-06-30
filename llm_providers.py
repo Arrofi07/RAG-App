@@ -159,7 +159,10 @@ class GeminiProvider(LLMProvider):
     PER_MODEL_MAX_429 = int(os.getenv("LLM_429_PER_MODEL_MAX", "3"))
 
     def __init__(self, api_key: str, models: list[str]):
-        import google.generativeai  # validate import at construction time
+        # Only the new google-genai SDK is needed — the old
+        # google.generativeai package is deprecated and was previously
+        # imported here unnecessarily, which triggered a FutureWarning
+        # on every startup. Removed.
         from google import genai as _genai
         self._client = _genai.Client(api_key=api_key)
         self.models  = models   # cascade order, e.g. ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
