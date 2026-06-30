@@ -36,6 +36,20 @@
 # The recommender and web search tool add ~0 MB steady-state RAM —
 # they are pure logic + network calls.
 
+# main.py  (v9.0.0 — Multi-provider LLM routing)
+#
+# WHAT CHANGED FROM v8 → v9
+# ──────────────────────────
+# The single Gemini `_call_llm()` function is replaced by a provider registry
+# (llm_providers.py) that routes each task to the right model:
+#
+#   role="enrichment" → local Ollama (Qwen3:1.7b) — NO Gemini quota used
+#   role="planning"   → local Ollama (Qwen3:1.7b) — intent, rewrite, search queries
+#   role="answer"     → Gemini cascade             — final student-facing answer
+#
+# All three roles are swappable via .env without touching this file.
+# See llm_providers.py for the full configuration reference.
+
 import os
 import uuid
 import logging
@@ -47,9 +61,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
-from google import genai
 
-# ── Local modules (existing) ───────────────────────────────────────────────────
+# ── Local modules ──────────────────────────────────────────────────────────────
 from data_loader import load_chunks, embed, EMBED_DIM, _get_embed_model
 from vector_db import QdrantStorage
 from reranker import rerank, warmup as warmup_reranker
@@ -60,10 +73,13 @@ from custom_types import (
     ChatMessage, MetaFilter, IngestResult, DocumentListResult,
     QueryResult, MatchItem, ConversationMeta, UserInfo, UserProfile,
 )
-
-# ── New modules (v8) ───────────────────────────────────────────────────────────
 from planner import classify_intent, execute_plan, build_augmented_context
 from university_recommender import UniversityRecommender
+
+# ── Provider registry (v9) ─────────────────────────────────────────────────────
+# build_registry() reads .env and constructs one LLMProvider per role.
+# call_llm(prompt, role=...) is the ONLY LLM call site used everywhere below.
+from llm_providers import build_registry, call_llm, check_providers, get_provider
 
 load_dotenv()
 
@@ -75,33 +91,12 @@ log = logging.getLogger(__name__)
 # Boot — initialise singletons
 # ─────────────────────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set.")
-
-# Gemini client for LLM generation and web search grounding
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-app   = FastAPI(title="Study-in-Germany AI Advisor API", version="8.0.0")
-store = QdrantStorage(dim=EMBED_DIM)   # Qdrant vector store (existing)
-db    = Storage()                       # SQLite user/conversation store (existing)
-
-# University recommender — new in v8
-# Initialised here so it shares the same DB file as Storage
+app   = FastAPI(title="Study-in-Germany AI Advisor API", version="9.0.0")
+store = QdrantStorage(dim=EMBED_DIM)
+db    = Storage()
 recommender = UniversityRecommender(db_path=Path("data/chatbot.db"))
 
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
-
-# Model cascade — fastest/cheapest first, fall back if rate-limited
-GEMINI_MODELS = (
-    os.getenv(
-        "GEMINI_MODELS",
-        "gemini-2.5-flash-lite,gemini-2.5-flash,gemini-3.5-flash,gemini-3.1-flash-lite",
-    ).split(",")
-)
-
-LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
-LLM_503_BACKOFF = float(os.getenv("LLM_503_BACKOFF", "5"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,174 +134,53 @@ class UpdateProfileRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM helper (unchanged from v7)
+# LLM helper — v9: thin wrapper around the provider registry
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# All the retry/cascade/429-handling logic now lives in llm_providers.py
+# (inside GeminiProvider, OllamaProvider, OpenAICompatibleProvider).
+# This wrapper just picks the right ROLE for each call site:
+#
+#   _llm_answer(prompt)      → role="answer"     (Gemini, student-facing)
+#   _llm_planning(prompt)    → role="planning"    (local Qwen, fast/free)
+#   _llm_enrichment(prompt)  → role="enrichment"  (local Qwen, ingestion)
 
-def _parse_retry_delay(exc: Exception) -> float:
-    """Extract server-suggested retry delay from a Gemini 429 error string."""
-    import re
+def _llm_answer(prompt: str) -> str:
+    """Generate the final, student-facing answer. Uses the 'answer' provider (default: Gemini)."""
     try:
-        m = re.search(r"'retryDelay':\s*'(\d+(?:\.\d+)?)s'", str(exc))
-        if m:
-            return float(m.group(1))
-    except Exception:
-        pass
-    return 30.0
+        return call_llm(prompt, role="answer")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Answer generation failed: {exc}")
 
 
-def _error_code(exc: Exception) -> int | None:
-    """Extract HTTP status code from a google-genai exception."""
-    import re
-    try:
-        m = re.match(r"^(\d{3})\s", str(exc))
-        if m:
-            return int(m.group(1))
-        code = getattr(exc, "code", None)
-        if isinstance(code, int):
-            return code
-    except Exception:
-        pass
-    return None
-
-
-def _call_llm(prompt: str, unlimited_retries: bool = False) -> str:
+def _llm_planning(prompt: str) -> str:
     """
-    Call the LLM with automatic retry and model cascade.
-
-    Args:
-        prompt           : the prompt to send
-        unlimited_retries: if True, retry 429/503 across ALL models in a round-
-                           robin loop until success (used during ingestion).
-                           If False, give up after LLM_MAX_RETRIES per model.
-
-    Retry policy (per-model):
-        429 → sleep max(retryDelay, MIN_429_DELAY) seconds, then retry.
-              After LLM_429_PER_MODEL_MAX consecutive 429s on one model,
-              move to the next model even in unlimited mode.
-        503 → sleep LLM_503_BACKOFF seconds, retry up to LLM_MAX_RETRIES.
-        Other → move to next model immediately (non-transient error).
-
-    In unlimited mode the outer loop restarts from the first model once all
-    models have been tried, so we never give up on transient quota errors.
-
-    TWO BUGS FIXED vs PREVIOUS VERSION
-    ────────────────────────────────────
-    Bug 1: Gemini sometimes returns retryDelay=0, causing instant re-fire.
-           Fix: enforce a minimum delay of MIN_429_DELAY seconds.
-    Bug 2: unlimited_retries looped forever on the SAME model, never cascading.
-           Fix: after LLM_429_PER_MODEL_MAX 429s on one model, move to the next.
+    Lightweight LLM calls for query rewriting, intent classification, and
+    search query construction. Uses the 'planning' provider (default: local
+    Ollama/Qwen3:1.7b) so these frequent small calls never touch Gemini quota.
     """
-    import time
+    return call_llm(prompt, role="planning")
 
-    # Minimum seconds to wait after a 429, even if Gemini says 0.
-    # Free-tier flash-lite = 15 RPM → one call per 4 s minimum.
-    # Using 5 s gives a small safety buffer.
-    MIN_429_DELAY = float(os.getenv("LLM_MIN_429_DELAY", "5"))
 
-    # How many consecutive 429s on one model before we cascade to the next,
-    # even in unlimited mode. Prevents getting stuck on a fully-exhausted quota.
-    LLM_429_PER_MODEL_MAX = int(os.getenv("LLM_429_PER_MODEL_MAX", "3"))
+def _llm_enrichment(prompt: str, unlimited_retries: bool = False) -> str:
+    """
+    Contextual chunk enrichment during PDF ingestion. Uses the 'enrichment'
+    provider (default: local Ollama/Qwen3:1.7b) — completely offline, so
+    ingesting large PDFs never hits a cloud rate limit.
 
-    last_exc: Exception | None = None
-
-    def _try_models_once() -> str | None:
-        """
-        Attempt each model once (with its own retry budget).
-        Returns the answer string on success, or None if all models fail.
-        Sets last_exc as a side-effect via nonlocal.
-        """
-        nonlocal last_exc
-
-        for model_name in GEMINI_MODELS:
-            consecutive_429s = 0  # reset counter for each model
-
-            for attempt in range(1, LLM_MAX_RETRIES + 2):
-                try:
-                    resp = client.models.generate_content(model=model_name, contents=prompt)
-                    if hasattr(resp, "text") and resp.text:
-                        if attempt > 1:
-                            log.info("%s succeeded on attempt %d", model_name, attempt)
-                        return resp.text.strip()
-                    # Empty response — treat as transient and retry once
-                    log.warning("%s: empty response (attempt %d)", model_name, attempt)
-
-                except Exception as exc:
-                    last_exc  = exc
-                    http_code = _error_code(exc)
-
-                    if http_code == 429:
-                        consecutive_429s += 1
-                        # Raw delay from Gemini header — enforce minimum
-                        raw_delay = _parse_retry_delay(exc)
-                        delay     = max(raw_delay, MIN_429_DELAY)
-                        if delay != raw_delay:
-                            log.debug(
-                                "retryDelay %.1fs is below minimum; using %.1fs",
-                                raw_delay, delay,
-                            )
-
-                        # Move to next model if we've hit too many 429s here
-                        if consecutive_429s >= LLM_429_PER_MODEL_MAX:
-                            log.warning(
-                                "%s — %d consecutive 429s, switching model. (last delay %.1fs)",
-                                model_name, consecutive_429s, delay,
-                            )
-                            # Still sleep the delay before trying the next model
-                            # so we don't immediately hammer a fresh quota.
-                            time.sleep(delay)
-                            break  # → next model in outer for-loop
-
-                        log.warning(
-                            "%s — 429 (attempt %d/%d). Waiting %.1fs…",
-                            model_name, attempt,
-                            LLM_MAX_RETRIES + 1, delay,
-                        )
-                        time.sleep(delay)
-                        continue  # retry same model
-
-                    elif http_code == 503:
-                        if attempt <= LLM_MAX_RETRIES:
-                            log.warning(
-                                "%s — 503 overloaded (attempt %d/%d). Waiting %.1fs…",
-                                model_name, attempt, LLM_MAX_RETRIES + 1, LLM_503_BACKOFF,
-                            )
-                            time.sleep(LLM_503_BACKOFF)
-                            continue
-                        log.warning("%s — 503 exhausted. Next model.", model_name)
-                        break
-
-                    else:
-                        # Non-transient (bad request, auth error, etc.)
-                        log.warning("%s — error %s: %s", model_name, http_code, exc)
-                        break  # → next model
-
-        return None  # all models failed this round
-
-    if unlimited_retries:
-        # Keep cycling through all models until one succeeds.
-        # This is used during ingestion so a PDF is never aborted by quota.
-        round_num = 0
-        while True:
-            round_num += 1
-            result = _try_models_once()
-            if result is not None:
-                return result
-            # All models rate-limited — wait before starting another round
-            pause = MIN_429_DELAY * 2
-            log.warning(
-                "All models rate-limited (round %d). Waiting %.1fs before retry…",
-                round_num, pause,
-            )
-            time.sleep(pause)
-    else:
-        result = _try_models_once()
-        if result is not None:
-            return result
-
-    raise HTTPException(
-        status_code=503,
-        detail=f"All LLM backends unavailable. Last error: {last_exc}",
-    )
+    unlimited_retries is passed through only if the underlying provider
+    supports it (currently GeminiProvider); OllamaProvider ignores it since
+    a local model has no quota to exhaust — failures there are usually
+    "Ollama isn't running", which retrying won't fix.
+    """
+    provider = get_provider("enrichment")
+    # Only GeminiProvider.call() accepts unlimited_retries; other providers
+    # use the base class signature (prompt only). We detect support via hasattr.
+    import inspect
+    sig = inspect.signature(provider.call)
+    if "unlimited_retries" in sig.parameters:
+        return provider.call(prompt, unlimited_retries=unlimited_retries)
+    return provider.call(prompt)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,7 +210,7 @@ Latest message: {question}
 Rewritten question:"""
 
     try:
-        return _call_llm(prompt)
+        return _llm_planning(prompt)
     except Exception:
         log.warning("Query rewriting failed, using original.")
         return question
@@ -361,13 +235,24 @@ def _expand_with_window(candidates: list[dict]) -> list[dict]:
 @app.on_event("startup")
 def _startup() -> None:
     """
-    Pre-load ML models and seed the university database on server start.
+    Build the LLM provider registry, pre-load ML models, and seed the
+    university database on server start.
 
-    We do this at startup rather than on first request so that:
-      1. Cold-start latency is paid once (when you run the server), not
-         when the first student asks a question.
-      2. The university DB is always ready — no first-query lag.
+    Order matters:
+      1. build_registry()  — read .env, construct each LLMProvider (cheap, no I/O)
+      2. check_providers() — ping Ollama if used, log warnings (non-fatal)
+      3. Load embedding + reranker models (~2.3 GB each, ~30-60s on M2)
+      4. Seed university DB (uses the embedding model + enrichment LLM)
     """
+    # Build the provider registry FIRST — everything below may call_llm()
+    log.info("Building LLM provider registry…")
+    build_registry()
+
+    # Health-check local providers (e.g. Ollama). Logs warnings, doesn't crash
+    # startup — if Ollama isn't running yet, you'll see a clear warning telling
+    # you to run `ollama serve && ollama pull qwen3:1.7b`.
+    check_providers()
+
     # Pre-load the embedding model (~2.3 GB into RAM)
     log.info("Pre-loading embedding model…")
     _get_embed_model()
@@ -517,9 +402,11 @@ async def ingest_pdf(
             #    numbered list.  This cuts total calls by ~5-10×.
             # 2. INTER-BATCH DELAY: sleep CONTEXT_INTER_BATCH_DELAY seconds
             #    between batches to stay under the RPM ceiling.
-            # 3. UNLIMITED RETRIES: pass unlimited_retries=True to _call_llm
-            #    so a 429 during ingestion is always honoured and retried (with
-            #    the server-suggested delay) rather than aborting mid-PDF.
+            # 3. ENRICHMENT ROLE: call_llm via role="enrichment" routes to the
+            #    local Ollama/Qwen3:1.7b provider by default — completely
+            #    offline, zero Gemini quota used during ingestion. If your
+            #    enrichment provider IS Gemini (you changed .env), unlimited
+            #    retries still apply via GeminiProvider's cascade logic.
             #
             # TUNING (edit via environment variables)
             # ─────────────────────────────────────────
@@ -584,9 +471,11 @@ Rules:
 Numbered context list:"""
 
                 try:
-                    # unlimited_retries=True means a 429 during ingestion will
-                    # always be honoured and retried, never aborting the PDF.
-                    raw = _call_llm(batch_prompt, unlimited_retries=True)
+                    # role="enrichment" → local Ollama/Qwen3:1.7b by default.
+                    # unlimited_retries only matters if you've configured Gemini
+                    # as the enrichment provider; Ollama ignores the flag since
+                    # local inference has no quota to exhaust.
+                    raw = _llm_enrichment(batch_prompt, unlimited_retries=True)
 
                     # Parse the numbered list response.
                     # Lines look like "1. This chunk covers admission requirements…"
@@ -719,16 +608,20 @@ def query(req: QueryRequest):
     if rewritten != question:
         log.info("Rewritten: '%s' → '%s'", question, rewritten)
 
-    # ── Stage 2: Intent classification (NEW v8) ────────────────────────────────
+    # ── Stage 2: Intent classification (v9: routed to 'planning' provider) ─────
     # The force_intent field lets the frontend bypass classification for
     # specific UI actions (e.g. a "Find Universities" button always forces
     # the recommender intent regardless of the question text).
-    intent = req.force_intent or classify_intent(rewritten, _call_llm)
+    # classify_intent() takes a call_llm callable — we pass _llm_planning so
+    # this fast, frequent classification call uses local Qwen, not Gemini.
+    intent = req.force_intent or classify_intent(rewritten, _llm_planning)
     log.info("Intent: %s", intent)
 
-    # ── Stage 3: Execute plan (NEW v8) ────────────────────────────────────────
+    # ── Stage 3: Execute plan ───────────────────────────────────────────────────
     # The recommender is wired in here via a lambda so university_recommender.py
     # never imports main.py (avoids circular imports).
+    # planner.execute_plan also uses call_llm internally for search-query
+    # building — we pass _llm_planning so that stays on the local model too.
     def _recommend(profile, question):
         return recommender.recommend(
             profile=profile,
@@ -741,7 +634,7 @@ def query(req: QueryRequest):
         question=rewritten,
         profile=profile,
         intent=intent,
-        call_llm=_call_llm,
+        call_llm=_llm_planning,
         recommender_fn=_recommend,
     )
 
@@ -814,7 +707,11 @@ User: {question}
 
 Advisor:"""
 
-    answer = _call_llm(prompt)
+    # Final, student-facing answer — uses role="answer" (Gemini cascade by
+    # default). This is the ONLY call in the whole query flow that touches
+    # Gemini quota, since rewriting/classification/planning all use the local
+    # 'planning' provider above.
+    answer = _llm_answer(prompt)
 
     # Persist assistant answer
     if req.conversation_id:
@@ -826,7 +723,13 @@ Advisor:"""
             title = question[:60] + ("…" if len(question) > 60 else "")
             db.update_conversation_title(req.conversation_id, title)
 
-    # Build the response — include new v8 fields in the match items
+    # Build the response — include planner intent + web sources (v8/v9 fields)
+    web_sources_out = []
+    if plan_result.used_web_search:
+        for raw in plan_result.web_results:
+            for src in raw.get("sources", []):
+                web_sources_out.append({"title": src.get("title", ""), "url": src.get("url", "")})
+
     return QueryResult(
         answer=answer,
         sources=sources,
@@ -834,6 +737,8 @@ Advisor:"""
         retrieval_mode=retrieval_mode,
         rewritten_question=rewritten if rewritten != question else None,
         window_expanded=window_expanded,
+        intent=plan_result.intent,
+        web_sources=web_sources_out or None,
         matches=[
             MatchItem(
                 text=c["text"],
