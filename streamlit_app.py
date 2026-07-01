@@ -58,12 +58,31 @@ for key, default in {
 # API helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def api(method: str, path: str, **kwargs):
-    """Make an API call to the FastAPI backend. Returns the Response or None."""
+def api(method: str, path: str, timeout: int = 60, **kwargs):
+    """
+    Make an API call to the FastAPI backend. Returns the Response or None.
+
+    Args:
+        timeout: seconds to wait before giving up. Default 60s is fine for
+                 chat/profile/list endpoints, but FAR too short for /ingest
+                 with contextual enrichment enabled — a large PDF can take
+                 several minutes (each chunk batch = 1 LLM call + pause).
+                 Callers doing slow operations should pass a larger timeout
+                 explicitly (see _render_upload_form below).
+    """
     url = f"{API_BASE}{path}"
     try:
-        resp = getattr(requests, method)(url, timeout=60, **kwargs)
+        resp = getattr(requests, method)(url, timeout=timeout, **kwargs)
         return resp
+    except requests.exceptions.ReadTimeout:
+        st.error(
+            f"⏱️ Request timed out after {timeout}s. "
+            f"For PDF ingestion with contextual enrichment, this can happen on "
+            f"large documents — but **ingestion is likely still running in the "
+            f"background** (check your backend terminal). Increase the timeout "
+            f"or wait, then refresh to see if it completed."
+        )
+        return None
     except Exception as e:
         st.error(f"Backend error: {e}")
         return None
@@ -274,7 +293,24 @@ def render_sidebar():
 
 
 def _render_upload_form():
-    """PDF upload form in the sidebar."""
+    """
+    PDF upload form in the sidebar.
+
+    TIMEOUT FIX
+    ───────────
+    Contextual enrichment processes chunks in batches of CONTEXT_BATCH_SIZE
+    (default 5), with a CONTEXT_INTER_BATCH_DELAY pause (default 5s) between
+    batches, plus the LLM call itself (~1-3s on local Qwen3:1.7b, more if it
+    falls back/retries). For a 133-chunk PDF like in your log:
+        133 chunks ÷ 5 per batch ≈ 27 batches
+        27 batches × (LLM call ~2s + 5s pause) ≈ 27 × 7s ≈ 189s (~3 minutes)
+    The OLD hardcoded 60s timeout always failed on anything over ~40 chunks.
+
+    We now estimate a generous timeout from the PDF's page count (each PDF
+    page becomes roughly one chunk in this pipeline — see data_loader.py),
+    with a wide safety margin, and show the estimate to the user up front so
+    a 3-minute wait doesn't feel like a hang.
+    """
     uploaded = st.file_uploader("PDF file", type=["pdf"], label_visibility="collapsed")
     if not uploaded:
         return
@@ -286,10 +322,57 @@ def _render_upload_form():
     tags     = st.text_input("Tags (comma-separated)", key="tags_inp")
     use_ctx  = st.checkbox("Contextual enrichment (slower, smarter)", value=False)
 
+    # ── Estimate processing time so the user knows what to expect ─────────────
+    # Cheap page-count check using pypdf (already a transitive dep via
+    # llama-index-readers-file). Falls back gracefully if it's unavailable.
+    est_pages = None
+    try:
+        import pypdf
+        reader    = pypdf.PdfReader(uploaded)
+        est_pages = len(reader.pages)
+        uploaded.seek(0)  # reset stream position after reading for the count
+    except Exception:
+        pass  # estimate unavailable — we'll just use a safe default timeout
+
+    if use_ctx and est_pages:
+        batch_size  = 5    # matches CONTEXT_BATCH_SIZE default in main.py
+        pause_s     = 5    # matches CONTEXT_INTER_BATCH_DELAY default
+        est_batches = max(1, -(-est_pages // batch_size))  # ceil division
+        est_seconds = est_batches * (pause_s + 3)  # +3s assumed LLM call time
+        st.info(
+            f"📄 ~{est_pages} pages → ~{est_batches} enrichment batches → "
+            f"**estimated {est_seconds // 60}m {est_seconds % 60}s**. "
+            f"Large PDFs take a while — this is normal, not a hang."
+        )
+    elif use_ctx:
+        st.info(
+            "Contextual enrichment is on. Large PDFs (50+ pages) can take "
+            "several minutes — this is normal, not a hang."
+        )
+
     if st.button("⬆️ Ingest PDF"):
+        # Generous timeout scaled to the estimate, with a hard floor of 5
+        # minutes and ceiling of 20 minutes (catches pathological cases
+        # without blocking the UI forever on a truly stuck request).
+        if use_ctx and est_pages:
+            dynamic_timeout = min(max(est_seconds + 60, 300), 1200)
+        else:
+            # No contextual enrichment → ingestion is just embedding + Qdrant
+            # upsert, which is fast even for large PDFs. Still give headroom.
+            dynamic_timeout = 300
+
+        progress_placeholder = st.empty()
+        progress_placeholder.info(
+            f"⏳ Ingesting… this window will wait up to {dynamic_timeout // 60} "
+            f"minutes. **Do not close this tab.** You can also watch progress "
+            f"live in your backend terminal (look for 'Contextual enrichment: "
+            f"chunks X–Y / N')."
+        )
+
         with st.spinner("Ingesting…"):
             r = api(
                 "post", "/ingest",
+                timeout=dynamic_timeout,
                 files={"file": (uploaded.name, uploaded.getvalue(), "application/pdf")},
                 data={
                     "category":       category or "",
@@ -299,12 +382,47 @@ def _render_upload_form():
                     "use_contextual": "true" if use_ctx else "false",
                 },
             )
+
+        progress_placeholder.empty()
+
         if r and r.ok:
             res = r.json()
             st.success(f"✅ {res['chunks']} chunks ingested from {res['source']}")
             st.cache_data.clear()
+        elif r is not None:
+            # api() returned a Response but it wasn't .ok (e.g. 400/500) —
+            # show the actual backend error instead of a generic message.
+            try:
+                detail = r.json().get("detail", r.text)
+            except Exception:
+                detail = r.text
+            st.error(f"Ingestion failed ({r.status_code}): {detail}")
         else:
-            st.error("Ingestion failed. Check backend logs.")
+            # api() already showed a timeout/connection error via st.error.
+            # Since the backend often keeps processing after a client-side
+            # timeout (the request is server-side, not cancelled), offer a
+            # one-click way to check if it actually finished instead of
+            # forcing a re-upload.
+            if st.button("🔄 Check if ingestion actually finished"):
+                with st.spinner("Checking document list…"):
+                    check = api("get", "/documents/metadata", timeout=15)
+                if check and check.ok:
+                    docs = check.json().get("documents", [])
+                    names = [d.get("filename", "") for d in docs]
+                    if uploaded.name in names:
+                        st.success(
+                            f"✅ Good news — '{uploaded.name}' IS in the knowledge "
+                            f"base. The ingestion succeeded; only the dashboard "
+                            f"connection timed out waiting for the response."
+                        )
+                        st.cache_data.clear()
+                    else:
+                        st.warning(
+                            f"'{uploaded.name}' was not found yet. It may still "
+                            f"be processing — check your backend terminal for "
+                            f"progress, then try this check again in a minute."
+                        )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

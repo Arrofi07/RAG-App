@@ -31,6 +31,10 @@ dependencies = [
     # ── PDF loading and chunking ───────────────────────────────────────────────
     "llama-index-core>=0.14.22",
     "llama-index-readers-file>=0.6.0",
+    # pypdf — already pulled in transitively by llama-index-readers-file, but
+    # pinned explicitly because streamlit_app.py imports it directly to
+    # estimate ingestion time (page count → expected enrichment batches).
+    "pypdf>=4.0.0",
 
     # ── Numerical operations (vector similarity in recommender) ────────────────
     "numpy>=1.26.0",
