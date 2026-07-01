@@ -81,7 +81,10 @@ from university_recommender import UniversityRecommender
 # call_llm(prompt, role=...) is the ONLY LLM call site used everywhere below.
 from llm_providers import build_registry, call_llm, check_providers, get_provider
 
-load_dotenv()
+load_dotenv(
+    dotenv_path=Path(__file__).parent / ".env",  # always find .env next to main.py,
+    override=True,                               # regardless of CWD when uvicorn runs
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)

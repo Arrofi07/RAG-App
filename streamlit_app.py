@@ -27,7 +27,10 @@ from dotenv import load_dotenv
 
 from advisor_config import PROFILE_FIELDS
 
-load_dotenv()
+load_dotenv(
+    dotenv_path=Path(__file__).parent / ".env",
+    override=True,
+)
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
