@@ -392,32 +392,38 @@ async def ingest_pdf(
             # Gemini free tier limits are tight:
             #   gemini-2.5-flash-lite : 15 RPM (= 1 call every 4 seconds)
             #   gemini-2.5-flash      : 10 RPM (= 1 call every 6 seconds)
-            # Firing one LLM call per chunk with no delay saturates the quota
-            # within seconds on any PDF with more than ~3 pages.
+            # ── Batch enrichment config ───────────────────────────────────────
             #
-            # THREE-LAYER FIX
-            # ───────────────
-            # 1. BATCH: send up to CONTEXT_BATCH_SIZE chunks in a SINGLE LLM
-            #    call, asking the model to return one context per chunk as a
-            #    numbered list.  This cuts total calls by ~5-10×.
-            # 2. INTER-BATCH DELAY: sleep CONTEXT_INTER_BATCH_DELAY seconds
-            #    between batches to stay under the RPM ceiling.
-            # 3. ENRICHMENT ROLE: call_llm via role="enrichment" routes to the
-            #    local Ollama/Qwen3:1.7b provider by default — completely
-            #    offline, zero Gemini quota used during ingestion. If your
-            #    enrichment provider IS Gemini (you changed .env), unlimited
-            #    retries still apply via GeminiProvider's cascade logic.
+            # INTER-BATCH DELAY was originally added to stay under Gemini's
+            # RPM ceiling (15 req/min on free tier = 4s minimum between calls).
+            # But the enrichment role now defaults to LOCAL Ollama/Qwen3:1.7b,
+            # which has NO rate limit — adding a 5s pause between every batch
+            # is pure wasted time.
             #
-            # TUNING (edit via environment variables)
-            # ─────────────────────────────────────────
-            # CONTEXT_BATCH_SIZE         default 5  — chunks per LLM call
-            #   Larger → fewer calls but longer prompts. Stay ≤ 8 for reliability.
-            # CONTEXT_INTER_BATCH_DELAY  default 5  — seconds between batches
-            #   Set to 6+ if you still see 429s with the default model.
-            #   Set to 0 if you have a paid Gemini plan with higher RPM limits.
+            # NEW BEHAVIOUR: auto-detect the enrichment provider type and set
+            # sensible defaults accordingly:
+            #
+            #   Local (Ollama):  batch_size=20, delay=0s
+            #     → 133 chunks ÷ 20 = 7 batches × ~3s each ≈ ~21s total
+            #
+            #   Cloud (Gemini):  batch_size=5,  delay=5s  (original safe values)
+            #     → 133 chunks ÷ 5 = 27 batches × ~8s each ≈ ~216s total
+            #
+            # You can still override both via .env:
+            #   CONTEXT_BATCH_SIZE=10          — chunks per LLM call
+            #   CONTEXT_INTER_BATCH_DELAY=2    — seconds between batches (0 = off)
 
-            CONTEXT_BATCH_SIZE        = int(os.getenv("CONTEXT_BATCH_SIZE", "5"))
-            CONTEXT_INTER_BATCH_DELAY = float(os.getenv("CONTEXT_INTER_BATCH_DELAY", "5"))
+            from llm_providers import get_provider, OllamaProvider as _OllamaProvider
+
+            _enrichment_provider = get_provider("enrichment")
+            _is_local = isinstance(_enrichment_provider, _OllamaProvider)
+
+            # Per-env overrides take precedence; otherwise use smart defaults
+            _default_batch  = "20" if _is_local else "5"
+            _default_delay  = "0"  if _is_local else "5"
+
+            CONTEXT_BATCH_SIZE        = int(os.getenv("CONTEXT_BATCH_SIZE", _default_batch))
+            CONTEXT_INTER_BATCH_DELAY = float(os.getenv("CONTEXT_INTER_BATCH_DELAY", _default_delay))
 
             # Truncate document preview (same as context_builder.py uses)
             DOC_PREVIEW_CHARS = 3000
@@ -425,6 +431,16 @@ async def ingest_pdf(
 
             # Pre-fill with empty strings so the list is always len(chunks)
             contextual_texts = [""] * len(chunks)
+
+            # ── Time estimate upfront ─────────────────────────────────────────
+            total_batches = max(1, -(-len(chunks) // CONTEXT_BATCH_SIZE))  # ceil
+            provider_name = _enrichment_provider.name
+            log.info(
+                "Contextual enrichment plan: %d chunks → %d batches of %d "
+                "(delay=%.0fs between batches) via %s",
+                len(chunks), total_batches, CONTEXT_BATCH_SIZE,
+                CONTEXT_INTER_BATCH_DELAY, provider_name,
+            )
 
             # Process chunks in batches
             for batch_start in range(0, len(chunks), CONTEXT_BATCH_SIZE):
@@ -502,9 +518,9 @@ Numbered context list:"""
                         batch_start + 1, batch_end, exc,
                     )
 
-                # Polite inter-batch pause to stay under RPM ceiling.
-                # Skip delay after the last batch (no next call needed).
-                if batch_end < len(chunks):
+                # Inter-batch pause — only needed for cloud providers with RPM
+                # limits. Local Ollama has no rate limit so delay defaults to 0.
+                if CONTEXT_INTER_BATCH_DELAY > 0 and batch_end < len(chunks):
                     log.info(
                         "Rate-limit pause: sleeping %.1fs before next batch…",
                         CONTEXT_INTER_BATCH_DELAY,

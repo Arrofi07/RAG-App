@@ -335,14 +335,28 @@ def _render_upload_form():
         pass  # estimate unavailable — we'll just use a safe default timeout
 
     if use_ctx and est_pages:
-        batch_size  = 5    # matches CONTEXT_BATCH_SIZE default in main.py
-        pause_s     = 5    # matches CONTEXT_INTER_BATCH_DELAY default
-        est_batches = max(1, -(-est_pages // batch_size))  # ceil division
-        est_seconds = est_batches * (pause_s + 3)  # +3s assumed LLM call time
+        # Match the auto-detection logic in main.py:
+        # local Ollama → batch_size=20, delay=0s, ~3s per batch call
+        # cloud Gemini → batch_size=5,  delay=5s, ~8s per batch call
+        # We don't know the provider from the UI, but we can read the env var
+        # to give an accurate estimate. Default assumes local (Ollama).
+        enrich_provider = os.getenv("ENRICHMENT_PROVIDER", "ollama").lower()
+        is_local        = enrich_provider == "ollama"
+
+        default_batch  = int(os.getenv("CONTEXT_BATCH_SIZE",        "20" if is_local else "5"))
+        default_delay  = float(os.getenv("CONTEXT_INTER_BATCH_DELAY", "0" if is_local else "5"))
+        call_time_s    = 3 if is_local else 5   # rough per-batch LLM time
+
+        est_batches  = max(1, -(-est_pages // default_batch))   # ceil division
+        est_seconds  = int(est_batches * (default_delay + call_time_s))
+        time_str     = f"{est_seconds // 60}m {est_seconds % 60}s" if est_seconds >= 60 else f"~{est_seconds}s"
+
         st.info(
-            f"📄 ~{est_pages} pages → ~{est_batches} enrichment batches → "
-            f"**estimated {est_seconds // 60}m {est_seconds % 60}s**. "
-            f"Large PDFs take a while — this is normal, not a hang."
+            f"📄 **{est_pages} pages** → {est_batches} enrichment batches "
+            f"(batch size {default_batch}, delay {default_delay:.0f}s) → "
+            f"estimated **{time_str}**. "
+            + ("Local Qwen is fast — no rate-limit pauses. ✅" if is_local
+               else "Cloud provider — pauses between batches to respect RPM limits.")
         )
     elif use_ctx:
         st.info(
@@ -355,7 +369,7 @@ def _render_upload_form():
         # minutes and ceiling of 20 minutes (catches pathological cases
         # without blocking the UI forever on a truly stuck request).
         if use_ctx and est_pages:
-            dynamic_timeout = min(max(est_seconds + 60, 300), 1200)
+            dynamic_timeout = min(max(est_seconds + 60, 120), 1200)
         else:
             # No contextual enrichment → ingestion is just embedding + Qdrant
             # upsert, which is fast even for large PDFs. Still give headroom.
