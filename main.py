@@ -76,6 +76,12 @@ from custom_types import (
 from planner import classify_intent, execute_plan, build_augmented_context
 from university_recommender import UniversityRecommender
 
+# ── Auth (v10) ─────────────────────────────────────────────────────────────────
+from auth import (
+    hash_password, verify_password, create_access_token,
+    get_current_user, get_current_user_id, validate_password_strength,
+)
+
 # ── Provider registry (v9) ─────────────────────────────────────────────────────
 # build_registry() reads .env and constructs one LLMProvider per role.
 # call_llm(prompt, role=...) is the ONLY LLM call site used everywhere below.
@@ -135,6 +141,24 @@ class CreateUserRequest(BaseModel):
 class UpdateProfileRequest(BaseModel):
     profile: dict[str, Any]
 
+
+# ── Auth request models (v10) ──────────────────────────────────────────────────
+ 
+class RegisterRequest(BaseModel):
+    name:     str
+    email:    str        # EmailStr would need email-validator pkg; plain str is fine
+    password: str
+ 
+class LoginRequest(BaseModel):
+    email:    str
+    password: str
+ 
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type:   str = "bearer"
+    user_id:      str
+    name:         str
+    email:        str
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM helper — v9: thin wrapper around the provider registry
@@ -284,6 +308,95 @@ def root():
         "version": "8.0.0 — agentic planner + web search + university recommender",
     }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth endpoints (v10)
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@app.post("/auth/register", response_model=TokenResponse, status_code=201)
+def register(req: RegisterRequest):
+    """
+    Register a new user with email + password.
+    Returns a JWT token immediately (no email verification yet — see auth.py).
+    """
+    # Validate password strength before touching the DB
+    error = validate_password_strength(req.password)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+ 
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Name cannot be empty.")
+ 
+    if not req.email.strip() or "@" not in req.email:
+        raise HTTPException(status_code=400, detail="Invalid email address.")
+ 
+    # Hash before storing — the plain password never touches the DB
+    hashed = hash_password(req.password)
+ 
+    try:
+        uid = db.register_user(
+            name=req.name.strip(),
+            email=req.email.strip(),
+            password_hash=hashed,
+        )
+    except ValueError as exc:
+        # Email already registered
+        raise HTTPException(status_code=409, detail=str(exc))
+ 
+    token = create_access_token(user_id=uid, email=req.email.strip().lower())
+    log.info("New user registered: %s (%s)", req.name, req.email)
+ 
+    return TokenResponse(
+        access_token=token,
+        user_id=uid,
+        name=req.name.strip(),
+        email=req.email.strip().lower(),
+    )
+ 
+ 
+@app.post("/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest):
+    """
+    Login with email + password. Returns a JWT on success.
+    Uses a constant-time comparison to avoid timing attacks.
+    """
+    user = db.get_user_by_email(req.email)
+ 
+    # Always run verify_password even if user is None — this prevents
+    # timing attacks that would reveal whether an email is registered.
+    dummy_hash = "$2b$12$invalidhashfortimingprotection000000000000000000000000"
+    stored_hash = user["password_hash"] if user else dummy_hash
+ 
+    password_ok = verify_password(req.password, stored_hash)
+ 
+    if not user or not password_ok:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+ 
+    if not user.get("is_active", 1):
+        raise HTTPException(status_code=403, detail="Account is disabled.")
+ 
+    token = create_access_token(user_id=user["id"], email=user["email"])
+    log.info("Login: %s", user["email"])
+ 
+    return TokenResponse(
+        access_token=token,
+        user_id=user["id"],
+        name=user["name"],
+        email=user["email"],
+    )
+ 
+ 
+@app.get("/auth/me")
+def me(current_user: dict = Depends(get_current_user)):
+    """Return the currently authenticated user's profile."""
+    user = db.get_user(current_user["sub"])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    # Never return password_hash to the client
+    user.pop("password_hash", None)
+    return user
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User / profile endpoints (unchanged from v7)
