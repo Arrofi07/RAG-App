@@ -59,8 +59,8 @@ from pathlib import Path
 from datetime import datetime
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from pydantic import BaseModel, EmailStr
 
 # ── Local modules ──────────────────────────────────────────────────────────────
 from data_loader import load_chunks, embed, EMBED_DIM, _get_embed_model
@@ -81,6 +81,9 @@ from auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, get_current_user_id, validate_password_strength,
 )
+
+# ── Deduplication helper ───────────────────────────────────────────────────────
+from storage import sha256 as _sha256_file
 
 # ── Provider registry (v9) ─────────────────────────────────────────────────────
 # build_registry() reads .env and constructs one LLMProvider per role.
@@ -143,22 +146,23 @@ class UpdateProfileRequest(BaseModel):
 
 
 # ── Auth request models (v10) ──────────────────────────────────────────────────
- 
+
 class RegisterRequest(BaseModel):
     name:     str
     email:    str        # EmailStr would need email-validator pkg; plain str is fine
     password: str
- 
+
 class LoginRequest(BaseModel):
     email:    str
     password: str
- 
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type:   str = "bearer"
     user_id:      str
     name:         str
     email:        str
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM helper — v9: thin wrapper around the provider registry
@@ -305,13 +309,14 @@ def _startup() -> None:
 def root():
     return {
         "status":  "running",
-        "version": "8.0.0 — agentic planner + web search + university recommender",
+        "version": "10.0.0 — auth + deduplication + eval",
     }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auth endpoints (v10)
 # ─────────────────────────────────────────────────────────────────────────────
- 
+
 @app.post("/auth/register", response_model=TokenResponse, status_code=201)
 def register(req: RegisterRequest):
     """
@@ -322,16 +327,16 @@ def register(req: RegisterRequest):
     error = validate_password_strength(req.password)
     if error:
         raise HTTPException(status_code=400, detail=error)
- 
+
     if not req.name.strip():
         raise HTTPException(status_code=400, detail="Name cannot be empty.")
- 
+
     if not req.email.strip() or "@" not in req.email:
         raise HTTPException(status_code=400, detail="Invalid email address.")
- 
+
     # Hash before storing — the plain password never touches the DB
     hashed = hash_password(req.password)
- 
+
     try:
         uid = db.register_user(
             name=req.name.strip(),
@@ -341,18 +346,18 @@ def register(req: RegisterRequest):
     except ValueError as exc:
         # Email already registered
         raise HTTPException(status_code=409, detail=str(exc))
- 
+
     token = create_access_token(user_id=uid, email=req.email.strip().lower())
     log.info("New user registered: %s (%s)", req.name, req.email)
- 
+
     return TokenResponse(
         access_token=token,
         user_id=uid,
         name=req.name.strip(),
         email=req.email.strip().lower(),
     )
- 
- 
+
+
 @app.post("/auth/login", response_model=TokenResponse)
 def login(req: LoginRequest):
     """
@@ -360,34 +365,34 @@ def login(req: LoginRequest):
     Uses a constant-time comparison to avoid timing attacks.
     """
     user = db.get_user_by_email(req.email)
- 
+
     # Always run verify_password even if user is None — this prevents
     # timing attacks that would reveal whether an email is registered.
     dummy_hash = "$2b$12$invalidhashfortimingprotection000000000000000000000000"
     stored_hash = user["password_hash"] if user else dummy_hash
- 
+
     password_ok = verify_password(req.password, stored_hash)
- 
+
     if not user or not password_ok:
         raise HTTPException(
             status_code=401,
             detail="Invalid email or password.",
         )
- 
+
     if not user.get("is_active", 1):
         raise HTTPException(status_code=403, detail="Account is disabled.")
- 
+
     token = create_access_token(user_id=user["id"], email=user["email"])
     log.info("Login: %s", user["email"])
- 
+
     return TokenResponse(
         access_token=token,
         user_id=user["id"],
         name=user["name"],
         email=user["email"],
     )
- 
- 
+
+
 @app.get("/auth/me")
 def me(current_user: dict = Depends(get_current_user)):
     """Return the currently authenticated user's profile."""
@@ -397,6 +402,7 @@ def me(current_user: dict = Depends(get_current_user)):
     # Never return password_hash to the client
     user.pop("password_hash", None)
     return user
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User / profile endpoints (unchanged from v7)
@@ -429,7 +435,14 @@ def get_user(user_id: str):
 
 
 @app.put("/users/{user_id}/profile")
-def update_profile(user_id: str, req: UpdateProfileRequest):
+def update_profile(
+    user_id: str,
+    req:     UpdateProfileRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    # Users can only update their own profile
+    if current_user["sub"] != user_id:
+        raise HTTPException(status_code=403, detail="Cannot modify another user's profile.")
     if not db.get_user(user_id):
         raise HTTPException(status_code=404, detail="User not found.")
     db.update_profile(user_id, req.profile)
@@ -441,7 +454,13 @@ def update_profile(user_id: str, req: UpdateProfileRequest):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/users/{user_id}/conversations")
-def create_conversation(user_id: str, title: str = "New conversation"):
+def create_conversation(
+    user_id: str,
+    title:   str = "New conversation",
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user["sub"] != user_id:
+        raise HTTPException(status_code=403, detail="Cannot create conversations for another user.")
     if not db.get_user(user_id):
         raise HTTPException(status_code=404, detail="User not found.")
     cid = db.create_conversation(user_id, title)
@@ -449,17 +468,39 @@ def create_conversation(user_id: str, title: str = "New conversation"):
 
 
 @app.get("/users/{user_id}/conversations", response_model=list[ConversationMeta])
-def list_conversations(user_id: str):
+def list_conversations(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    if current_user["sub"] != user_id:
+        raise HTTPException(status_code=403, detail="Cannot view another user's conversations.")
     return db.list_conversations(user_id)
 
 
 @app.get("/conversations/{conversation_id}/messages")
-def get_messages(conversation_id: str):
+def get_messages(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    # Verify the conversation belongs to this user
+    conv = db.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if conv["user_id"] != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Cannot view another user's messages.")
     return {"messages": db.get_messages(conversation_id)}
 
 
 @app.delete("/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str):
+def delete_conversation(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    conv = db.get_conversation(conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    if conv["user_id"] != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Cannot delete another user's conversation.")
     db.delete_conversation(conversation_id)
     return {"success": True}
 
@@ -476,6 +517,7 @@ async def ingest_pdf(
     year:           Optional[int] = Form(None),
     tags:           Optional[str] = Form(None),
     use_contextual: str           = Form("false"),
+    current_user:   dict          = Depends(get_current_user),
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
@@ -483,8 +525,28 @@ async def ingest_pdf(
     do_contextual = use_contextual.lower() in ("true", "1", "yes")
     tag_list      = ([t.strip() for t in tags.split(",") if t.strip()] if tags else [])
 
+    # ── Read file bytes FIRST for deduplication check ─────────────────────────
+    # We read the whole file into memory once so we can:
+    #   1. Compute the SHA-256 hash for deduplication (before writing to disk)
+    #   2. Write to a temp file for the PDF parser
+    contents     = await file.read()
+    content_hash = _sha256_file(contents)    # SHA-256 of the raw bytes
+    file_size    = len(contents)
+
+    # ── Deduplication check ───────────────────────────────────────────────────
+    # Check both filename AND content hash independently.
+    # This runs before any expensive processing so duplicates fail fast.
+    duplicate = db.check_duplicate(
+        filename=file.filename,
+        content_hash=content_hash,
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409,    # 409 Conflict is the correct HTTP status for duplicates
+            detail=duplicate["reason"],
+        )
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        contents = await file.read()
         tmp.write(contents)
         pdf_path = tmp.name
 
@@ -687,6 +749,20 @@ Numbered context list:"""
         store.upsert(ids=ids, dense_vectors=embeddings["dense"],
                      sparse_vectors=embeddings["sparse"], payloads=payloads)
 
+        # ── Record in deduplication table (AFTER successful Qdrant upsert) ────
+        # We record AFTER upsert so a failed ingest doesn't block re-tries.
+        db.record_document(
+            filename=source_id,
+            content_hash=content_hash,
+            file_size=file_size,
+            chunks_count=len(chunks),
+            category=category,
+            author=author,
+            year=year,
+            tags=tag_list,
+            uploaded_by=current_user["sub"],
+        )
+
         log.info("Ingested %d chunks from '%s' | contextual=%s",
                  len(chunks), source_id, do_contextual)
 
@@ -701,7 +777,7 @@ Numbered context list:"""
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResult)
-def query(req: QueryRequest):
+def query(req: QueryRequest, current_user: dict = Depends(get_current_user)):
     """
     Main query endpoint.  Now orchestrated by the agentic planner.
 
@@ -935,10 +1011,10 @@ def seed_universities():
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/documents", response_model=DocumentListResult)
-def list_documents():
+def list_documents(current_user: dict = Depends(get_current_user)):
     return DocumentListResult(documents=[d["filename"] for d in store.list_documents()])
 
 
 @app.get("/documents/metadata")
-def list_documents_metadata():
+def list_documents_metadata(current_user: dict = Depends(get_current_user)):
     return {"documents": store.list_documents()}
