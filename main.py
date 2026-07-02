@@ -82,6 +82,12 @@ from auth import (
     get_current_user, get_current_user_id, validate_password_strength,
 )
 
+# ── Eval (v10) ─────────────────────────────────────────────────────────────────
+from eval_engine import (
+    generate_eval_questions, load_eval_questions, delete_eval_questions,
+    run_retrieval_eval, run_answer_quality_eval, load_eval_runs, load_run_details,
+)
+
 # ── Deduplication helper ───────────────────────────────────────────────────────
 from storage import sha256 as _sha256_file
 
@@ -1018,3 +1024,135 @@ def list_documents(current_user: dict = Depends(get_current_user)):
 @app.get("/documents/metadata")
 def list_documents_metadata(current_user: dict = Depends(get_current_user)):
     return {"documents": store.list_documents()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Eval endpoints (v10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/eval/generate-questions")
+def eval_generate_questions(
+    n: int = 20,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Generate N synthetic eval questions from ingested chunks.
+    Uses the 'planning' provider (local Qwen) — no Gemini quota.
+    Stores questions in the eval_questions table.
+    """
+    questions = generate_eval_questions(
+        qdrant_store=store,
+        call_llm=_llm_planning,
+        n_questions=n,
+    )
+    return {"generated": len(questions), "questions": questions}
+
+
+@app.get("/eval/questions")
+def eval_list_questions(current_user: dict = Depends(get_current_user)):
+    """Return all stored eval questions."""
+    return {"questions": load_eval_questions()}
+
+
+@app.delete("/eval/questions")
+def eval_delete_questions(current_user: dict = Depends(get_current_user)):
+    """Delete all eval questions to regenerate from scratch."""
+    n = delete_eval_questions()
+    return {"deleted": n}
+
+
+@app.post("/eval/run-retrieval")
+def eval_run_retrieval(
+    top_k: int = 5,
+    notes: str = "",
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Run retrieval evaluation (Hit Rate + MRR) over all stored questions.
+    Fast and free — no LLM calls, just embedding + retrieval.
+    """
+    questions = load_eval_questions()
+    if not questions:
+        raise HTTPException(
+            status_code=400,
+            detail="No eval questions found. Call POST /eval/generate-questions first.",
+        )
+
+    result = run_retrieval_eval(
+        questions=questions,
+        embed_fn=embed,
+        qdrant_store=store,
+        rerank_fn=rerank,
+        top_k=top_k,
+        notes=notes,
+    )
+    return result
+
+
+@app.post("/eval/run-answer-quality")
+def eval_run_answer_quality(
+    top_k:       int = 5,
+    n_questions: int = 10,   # subset — answer quality eval is expensive
+    notes:       str = "",
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    On-demand RAGAS-style answer quality eval (faithfulness + answer relevancy).
+    Costs ~5–10 Gemini API calls per question. Run sparingly.
+    Uses a random subset of n_questions to limit cost.
+    """
+    import random
+    all_questions = load_eval_questions()
+    if not all_questions:
+        raise HTTPException(
+            status_code=400,
+            detail="No eval questions found. Call POST /eval/generate-questions first.",
+        )
+
+    # Sample a subset if we have more than n_questions
+    questions = (
+        random.sample(all_questions, n_questions)
+        if len(all_questions) > n_questions
+        else all_questions
+    )
+
+    # answer_fn wraps the full RAG pipeline for eval (returns answer + context)
+    def _answer_fn(question: str):
+        q_emb    = embed([question])
+        candidates = store.search_hybrid_candidates(
+            dense_vector=q_emb["dense"][0],
+            sparse_vector=q_emb["sparse"][0],
+            fetch_k=top_k * 3,
+        )
+        reranked = rerank(question, candidates, top_k=top_k)
+        context  = "\n\n".join(c["text"] for c in reranked)
+        prompt   = f"Answer this question based on the context:\n\n{context}\n\nQuestion: {question}\nAnswer:"
+        answer   = _llm_answer(prompt)
+        return answer, context
+
+    result = run_answer_quality_eval(
+        questions=questions,
+        embed_fn=embed,
+        qdrant_store=store,
+        answer_fn=_answer_fn,
+        call_llm=_llm_answer,   # RAGAS LLM calls use the answer provider (Gemini)
+        rerank_fn=rerank,
+        top_k=top_k,
+        notes=notes,
+    )
+    return result
+
+
+@app.get("/eval/runs")
+def eval_list_runs(current_user: dict = Depends(get_current_user)):
+    """Return all historical eval runs for the dashboard."""
+    return {"runs": load_eval_runs()}
+
+
+@app.get("/eval/runs/{run_id}")
+def eval_run_detail(run_id: str, current_user: dict = Depends(get_current_user)):
+    """Return per-question results for a specific eval run."""
+    details = load_run_details(run_id)
+    if not details:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return {"results": details}
