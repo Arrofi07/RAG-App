@@ -78,26 +78,28 @@ class Storage:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _init_schema(self) -> None:
-        """Create all tables. Safe to call on an existing DB (IF NOT EXISTS)."""
+        """
+        Create tables that don't exist yet. Safe to call on an existing DB.
+
+        IMPORTANT: auth columns (email, password_hash, is_verified, is_active)
+        are NOT listed here — they are added by _migrate() which runs immediately
+        after. This means both code paths (fresh DB and existing DB) go through
+        _migrate(), so there's no race between CREATE TABLE and ALTER TABLE.
+
+        The idx_users_email partial index is also created in _migrate() after
+        the email column is guaranteed to exist.
+        """
         with self._conn() as con:
             con.executescript("""
-                -- Users table (v10: includes auth columns)
+                -- Users table: original columns only.
+                -- Auth columns added by _migrate() below.
                 CREATE TABLE IF NOT EXISTS users (
-                    id             TEXT PRIMARY KEY,
-                    name           TEXT NOT NULL,
-                    email          TEXT UNIQUE,           -- NULL for pre-v10 rows
-                    password_hash  TEXT,                  -- bcrypt hash, never plain
-                    is_verified    INTEGER DEFAULT 0,     -- 0=false, 1=true
-                    is_active      INTEGER DEFAULT 1,     -- 0=disabled, 1=active
-                    profile        TEXT NOT NULL DEFAULT '{}',
-                    created_at     TEXT NOT NULL,
-                    updated_at     TEXT NOT NULL
+                    id         TEXT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    profile    TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
-
-                -- Index for fast login-by-email lookup
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
-                    ON users(email)
-                    WHERE email IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS conversations (
                     id          TEXT PRIMARY KEY,
@@ -121,23 +123,20 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS idx_msg_conv
                     ON messages(conversation_id, created_at ASC);
 
-                -- Documents table for deduplication (v10)
-                -- One row per successfully ingested PDF.
-                -- Both filename_hash AND content_hash are checked independently:
-                --   filename_hash: prevents re-uploading the same filename
-                --   content_hash:  prevents re-uploading identical content
-                --                  under a different filename
+                -- Documents table for deduplication.
+                -- filename_hash and content_hash are checked independently
+                -- before any ingestion (see check_duplicate()).
                 CREATE TABLE IF NOT EXISTS documents (
                     id             TEXT PRIMARY KEY,
                     filename       TEXT NOT NULL,
-                    filename_hash  TEXT NOT NULL UNIQUE,  -- SHA-256(lower(filename))
-                    content_hash   TEXT NOT NULL UNIQUE,  -- SHA-256(file bytes)
-                    file_size      INTEGER NOT NULL,       -- bytes
+                    filename_hash  TEXT NOT NULL UNIQUE,
+                    content_hash   TEXT NOT NULL UNIQUE,
+                    file_size      INTEGER NOT NULL,
                     chunks_count   INTEGER NOT NULL,
                     category       TEXT,
                     author         TEXT,
                     year           INTEGER,
-                    tags           TEXT,                   -- JSON array string
+                    tags           TEXT,
                     uploaded_by    TEXT REFERENCES users(id),
                     ingested_at    TEXT NOT NULL
                 );
@@ -150,18 +149,20 @@ class Storage:
 
     def _migrate(self) -> None:
         """
-        Non-destructive migration: add new columns to the users table if they
-        don't exist yet. This handles the case where you have an existing DB
-        from before v10 — existing rows keep all their data.
+        Non-destructive migration: add auth columns to the users table if they
+        don't exist yet. This is the ONLY place these columns are created —
+        runs on both fresh DBs (immediately after _init_schema creates the
+        bare table) and existing DBs (adds columns to the already-existing table).
 
-        SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we check the
-        column list manually before adding.
+        SQLite doesn't support IF NOT EXISTS on ALTER TABLE, so we check
+        the column list with PRAGMA table_info before each ALTER.
         """
         with self._conn() as con:
             existing = {
                 row[1]
                 for row in con.execute("PRAGMA table_info(users)").fetchall()
             }
+
             new_columns = {
                 "email":         "TEXT",
                 "password_hash": "TEXT",
@@ -172,6 +173,14 @@ class Storage:
                 if col not in existing:
                     con.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
                     log.info("DB migration: added column users.%s", col)
+
+            # Partial unique index on email — created here (not in _init_schema)
+            # so the email column is guaranteed to exist first.
+            con.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+                    ON users(email)
+                    WHERE email IS NOT NULL
+            """)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Auth — registration and login
