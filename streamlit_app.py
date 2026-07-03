@@ -1,22 +1,21 @@
-# streamlit_app.py  (v8.0.0)
+# streamlit_app.py  (v10.0.0)
 #
-# Streamlit frontend for the Study-in-Germany AI Advisor.
+# V10 CHANGES
+# ───────────
+# 1. AUTH PAGES — Login and Register screens shown when no JWT is in session.
+#    JWT stored in st.session_state["token"]. Lost on hard page refresh
+#    (known limitation of Streamlit — see auth.py for the design note).
 #
-# V8 CHANGES over v7:
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. INTENT BADGE  — each assistant reply now shows a small badge indicating
-#    which plan the agentic planner used (RAG / Web Search / University Match).
-#    Helps students understand why the answer looks the way it does.
+# 2. BEARER TOKEN on every api() call — the Authorization header is injected
+#    automatically so callers don't need to think about it.
 #
-# 2. WEB SOURCES PANEL — if the planner triggered a web search, the assistant
-#    message expands to show the live URLs that were searched.
+# 3. EVAL DASHBOARD PAGE — new sidebar nav item. Shows historical run scores
+#    as a line chart, lets you generate questions and trigger eval runs.
 #
-# 3. UNIVERSITY FINDER PAGE — a new sidebar tab calls POST /recommend directly
-#    from the student's saved profile.  Results are displayed as cards with
-#    key facts (city, fee, language, deadlines) and a match score bar.
+# 4. DUPLICATE HANDLING — the ingest form now shows a clear message on 409
+#    (duplicate) instead of a generic "Ingestion failed" error.
 #
-# 4. FORCE INTENT OPTION — power users can pin the intent from the chat input
-#    area (e.g. "always use web search" toggle for time-sensitive sessions).
+# 5. LOGOUT button in the sidebar.
 
 import os
 from pathlib import Path
@@ -27,10 +26,7 @@ from dotenv import load_dotenv
 
 from advisor_config import PROFILE_FIELDS
 
-load_dotenv(
-    dotenv_path=Path(__file__).parent / ".env",
-    override=True,
-)
+load_dotenv(dotenv_path=Path(__file__).parent / ".env", override=True)
 
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8000")
 
@@ -45,45 +41,57 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 
 for key, default in {
+    "token":           None,    # JWT string — presence means logged in
     "user_id":         None,
     "user_name":       None,
+    "user_email":      None,
     "profile":         {},
     "conversation_id": None,
     "messages":        [],
     "debug_info":      [],
-    "active_page":     "chat",  # "chat" | "universities" | "profile"
+    "active_page":     "chat",  # "chat" | "universities" | "profile" | "eval"
+    "auth_tab":        "login", # "login" | "register"
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API helpers
+# API helper — injects JWT automatically on every call
 # ─────────────────────────────────────────────────────────────────────────────
 
 def api(method: str, path: str, timeout: int = 60, **kwargs):
     """
-    Make an API call to the FastAPI backend. Returns the Response or None.
+    Make an authenticated API call. Injects the Bearer token automatically.
 
-    Args:
-        timeout: seconds to wait before giving up. Default 60s is fine for
-                 chat/profile/list endpoints, but FAR too short for /ingest
-                 with contextual enrichment enabled — a large PDF can take
-                 several minutes (each chunk batch = 1 LLM call + pause).
-                 Callers doing slow operations should pass a larger timeout
-                 explicitly (see _render_upload_form below).
+    Returns the Response object or None on network/timeout error.
+    Handles 401 globally — clears session and forces re-login.
     """
-    url = f"{API_BASE}{path}"
+    url     = f"{API_BASE}{path}"
+    headers = kwargs.pop("headers", {})
+
+    # Inject JWT if we have one
+    if st.session_state.token:
+        headers["Authorization"] = f"Bearer {st.session_state.token}"
+
     try:
-        resp = getattr(requests, method)(url, timeout=timeout, **kwargs)
+        resp = getattr(requests, method)(url, timeout=timeout, headers=headers, **kwargs)
+
+        # Global 401 handler — token expired or invalid
+        if resp.status_code == 401:
+            st.session_state.token    = None
+            st.session_state.user_id  = None
+            st.session_state.user_name = None
+            st.warning("Your session has expired. Please log in again.")
+            st.rerun()
+
         return resp
+
     except requests.exceptions.ReadTimeout:
         st.error(
             f"⏱️ Request timed out after {timeout}s. "
-            f"For PDF ingestion with contextual enrichment, this can happen on "
-            f"large documents — but **ingestion is likely still running in the "
-            f"background** (check your backend terminal). Increase the timeout "
-            f"or wait, then refresh to see if it completed."
+            "For large PDF ingestion this is normal — check your backend terminal. "
+            "Ingestion may still be completing in the background."
         )
         return None
     except Exception as e:
@@ -91,9 +99,14 @@ def api(method: str, path: str, timeout: int = 60, **kwargs):
         return None
 
 
+def _auth_headers() -> dict:
+    """Return Authorization header dict for use in api() calls that need explicit headers."""
+    return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
+
+
 @st.cache_data(ttl=30)
-def fetch_doc_metadata():
-    """Cached fetch of ingested document metadata for filter dropdowns."""
+def fetch_doc_metadata(_token: str):
+    """Cached fetch of document metadata. _token arg busts cache on login."""
     r = api("get", "/documents/metadata")
     return r.json().get("documents", []) if r and r.ok else []
 
@@ -104,29 +117,23 @@ def load_conversation(conv_id: str):
     if r and r.ok:
         msgs = r.json().get("messages", [])
         st.session_state.messages   = [{"role": m["role"], "content": m["content"]} for m in msgs]
-        # Reset debug info (one entry per assistant turn)
-        assistant_count = sum(1 for m in msgs if m["role"] == "assistant")
+        assistant_count             = sum(1 for m in msgs if m["role"] == "assistant")
         st.session_state.debug_info = [{} for _ in range(assistant_count)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intent badge helper
+# Intent badge helper (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Map planner intent strings → (emoji, label, colour)
 _INTENT_LABELS = {
-    "rag_only":               ("📄", "Knowledge Base",      "#3b82f6"),
-    "web_search":             ("🔍", "Live Web Search",     "#10b981"),
-    "university_recommender": ("🏫", "University Finder",   "#8b5cf6"),
-    "recommend_and_search":   ("🔍🏫", "Finder + Web",       "#f59e0b"),
+    "rag_only":               ("📄", "Knowledge Base",    "#3b82f6"),
+    "web_search":             ("🔍", "Live Web Search",   "#10b981"),
+    "university_recommender": ("🏫", "University Finder", "#8b5cf6"),
+    "recommend_and_search":   ("🔍🏫", "Finder + Web",    "#f59e0b"),
 }
 
-
 def _intent_badge(intent: str) -> str:
-    """Return an HTML span badge for the given intent."""
-    emoji, label, colour = _INTENT_LABELS.get(
-        intent, ("⚙️", intent, "#6b7280")
-    )
+    emoji, label, colour = _INTENT_LABELS.get(intent, ("⚙️", intent, "#6b7280"))
     return (
         f'<span style="background:{colour}22; color:{colour}; border:1px solid {colour}; '
         f'border-radius:4px; padding:2px 8px; font-size:0.75rem; font-weight:600;">'
@@ -135,123 +142,201 @@ def _intent_badge(intent: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ① PROFILE SETUP (shown before user is created)
+# ① AUTH PAGES — Login and Register
 # ─────────────────────────────────────────────────────────────────────────────
 
-def show_profile_setup():
+def show_auth_page():
+    """
+    Full-page login / register flow shown when no JWT is in session state.
+
+    Design note: we don't use st.tabs() here because switching tabs re-runs
+    the whole script and clears form state. Instead we use buttons to set
+    st.session_state.auth_tab and rerun.
+    """
     st.title("🎓 Study in Germany — AI Advisor")
-    st.subheader("Welcome! Let's set up your profile.")
-    st.caption(
-        "Your profile lets the advisor give you personalised, accurate advice. "
-        "You can update it any time from the sidebar."
-    )
 
-    # Check for existing users so returning visitors don't need to re-register
-    r = api("get", "/users")
-    existing = r.json() if r and r.ok else []
+    col_l, col_m, col_r = st.columns([1, 2, 1])
+    with col_m:
+        # Tab switcher
+        tab_col1, tab_col2 = st.columns(2)
+        if tab_col1.button(
+            "**🔑 Log In**" if st.session_state.auth_tab == "login" else "🔑 Log In",
+            use_container_width=True,
+            type="primary" if st.session_state.auth_tab == "login" else "secondary",
+        ):
+            st.session_state.auth_tab = "login"
+            st.rerun()
 
-    if existing:
-        with st.expander("👤 Continue as existing user"):
-            selected = st.selectbox(
-                "Select your name",
-                options=existing,
-                format_func=lambda u: u["name"],
-                key="existing_user_select",
-            )
-            if st.button("Continue", key="continue_existing"):
-                _set_user(selected["id"], selected["name"])
-                st.rerun()
+        if tab_col2.button(
+            "**📝 Register**" if st.session_state.auth_tab == "register" else "📝 Register",
+            use_container_width=True,
+            type="primary" if st.session_state.auth_tab == "register" else "secondary",
+        ):
+            st.session_state.auth_tab = "register"
+            st.rerun()
 
-    st.divider()
-    st.subheader("Create a new profile")
+        st.divider()
 
-    with st.form("new_profile_form"):
-        name = st.text_input("Your name *", placeholder="e.g. Budi Santoso")
+        if st.session_state.auth_tab == "login":
+            _show_login_form()
+        else:
+            _show_register_form()
+
+
+def _show_login_form():
+    st.subheader("Welcome back")
+
+    with st.form("login_form", clear_on_submit=False):
+        email    = st.text_input("Email", placeholder="you@example.com")
+        password = st.text_input("Password", type="password")
+        submit   = st.form_submit_button("Log In", use_container_width=True, type="primary")
+
+    if submit:
+        if not email or not password:
+            st.error("Please enter your email and password.")
+            return
+
+        r = api("post", "/auth/login", json={"email": email, "password": password})
+
+        if r and r.ok:
+            data = r.json()
+            _set_session(data)
+            st.success(f"Welcome back, {data['name']}!")
+            st.rerun()
+        elif r is not None:
+            try:
+                detail = r.json().get("detail", "Login failed.")
+            except Exception:
+                detail = "Login failed."
+            st.error(detail)
+
+
+def _show_register_form():
+    st.subheader("Create your account")
+    st.caption("Already have an account? Click **Log In** above.")
+
+    with st.form("register_form", clear_on_submit=False):
+        name     = st.text_input("Full name *", placeholder="e.g. Budi Santoso")
+        email    = st.text_input("Email *",     placeholder="you@example.com")
+        password = st.text_input("Password *",  type="password",
+                                  help="At least 8 characters, must include a number or uppercase letter.")
+        password2 = st.text_input("Confirm password *", type="password")
+
+        st.divider()
+        st.caption("**Your study profile** — fill in what you know, update later anytime")
 
         profile_data: dict = {}
-        # Render profile fields dynamically from advisor_config.py
         for field in PROFILE_FIELDS:
             key   = field["key"]
             label = field["label"]
             help_ = field.get("help", "")
-
             if field["type"] == "text":
-                profile_data[key] = st.text_input(label, help=help_,
-                                                   value=field.get("default", ""))
+                profile_data[key] = st.text_input(label, help=help_, value=field.get("default", ""))
             elif field["type"] == "select":
-                profile_data[key] = st.selectbox(label, options=field["options"],
-                                                  help=help_,
-                                                  index=field["options"].index(field["default"])
-                                                  if field.get("default") in field["options"] else 0)
+                profile_data[key] = st.selectbox(
+                    label, options=field["options"], help=help_,
+                    index=field["options"].index(field["default"])
+                    if field.get("default") in field["options"] else 0,
+                )
             elif field["type"] == "number":
                 profile_data[key] = st.number_input(label, help=help_,
-                                                     value=field.get("default", 0),
-                                                     min_value=0)
+                                                     value=field.get("default", 0), min_value=0)
             elif field["type"] == "textarea":
-                profile_data[key] = st.text_area(label, help=help_,
-                                                  value=field.get("default", ""))
+                profile_data[key] = st.text_area(label, help=help_, value=field.get("default", ""))
 
-        submitted = st.form_submit_button("✅ Save and start chatting")
+        submit = st.form_submit_button("Create Account & Start", use_container_width=True, type="primary")
 
-    if submitted:
+    if submit:
+        # Client-side validation before hitting the API
+        errors = []
         if not name.strip():
-            st.error("Please enter your name to continue.")
+            errors.append("Name is required.")
+        if not email.strip() or "@" not in email:
+            errors.append("A valid email is required.")
+        if not password:
+            errors.append("Password is required.")
+        elif password != password2:
+            errors.append("Passwords do not match.")
+        elif len(password) < 8:
+            errors.append("Password must be at least 8 characters.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
             return
 
-        r = api("post", "/users", json={"name": name.strip(), "profile": profile_data})
-        if r and r.ok:
-            user = r.json()
-            _set_user(user["id"], user["name"])
+        r = api("post", "/auth/register", json={
+            "name":     name.strip(),
+            "email":    email.strip(),
+            "password": password,
+            "profile":  profile_data,
+        })
 
-            # Start the first conversation immediately
-            rc = api("post", f"/users/{user['id']}/conversations",
+        if r and r.ok:
+            data = r.json()
+            _set_session(data)
+
+            # Create first conversation
+            rc = api("post", f"/users/{data['user_id']}/conversations",
                      params={"title": "First conversation"})
             if rc and rc.ok:
                 st.session_state.conversation_id = rc.json()["conversation_id"]
 
-            st.success("Profile saved! Starting your session…")
+            st.success(f"Account created! Welcome, {data['name']}.")
             st.rerun()
-        else:
-            st.error("Could not create profile. Is the backend running?")
+        elif r is not None:
+            try:
+                detail = r.json().get("detail", "Registration failed.")
+            except Exception:
+                detail = "Registration failed."
+            # 409 = email already registered
+            if r.status_code == 409:
+                st.error(f"{detail} Try logging in instead.")
+            else:
+                st.error(detail)
 
 
-def _set_user(user_id: str, user_name: str):
-    """Store the logged-in user's identity in session state."""
-    st.session_state.user_id   = user_id
-    st.session_state.user_name = user_name
-    # Fetch the full profile so sidebar fields are pre-filled
-    r = api("get", f"/users/{user_id}")
+def _set_session(auth_data: dict):
+    """Populate session state from a successful auth response."""
+    st.session_state.token      = auth_data["access_token"]
+    st.session_state.user_id    = auth_data["user_id"]
+    st.session_state.user_name  = auth_data["name"]
+    st.session_state.user_email = auth_data["email"]
+
+    # Fetch full profile
+    r = api("get", "/auth/me")
     if r and r.ok:
         st.session_state.profile = r.json().get("profile", {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ② SIDEBAR
+# ② SIDEBAR (shown when logged in)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_sidebar():
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state.user_name}")
+        st.caption(st.session_state.user_email or "")
 
         # ── Page navigation ────────────────────────────────────────────────────
         st.divider()
-        if st.button("💬 Chat with Advisor", use_container_width=True):
-            st.session_state.active_page = "chat"
-            st.rerun()
-
-        if st.button("🏫 Find Universities", use_container_width=True):
-            st.session_state.active_page = "universities"
-            st.rerun()
-
-        if st.button("👤 Edit My Profile", use_container_width=True):
-            st.session_state.active_page = "profile"
-            st.rerun()
+        pages = [
+            ("chat",         "💬 Chat with Advisor"),
+            ("universities", "🏫 Find Universities"),
+            ("eval",         "📊 Eval Dashboard"),
+            ("profile",      "👤 Edit My Profile"),
+        ]
+        for page_id, label in pages:
+            btn_type = "primary" if st.session_state.active_page == page_id else "secondary"
+            if st.button(label, use_container_width=True, type=btn_type, key=f"nav_{page_id}"):
+                st.session_state.active_page = page_id
+                st.rerun()
 
         # ── Conversation management ────────────────────────────────────────────
         st.divider()
         st.markdown("**Conversations**")
 
-        r = api("get", f"/users/{st.session_state.user_id}/conversations")
+        r    = api("get", f"/users/{st.session_state.user_id}/conversations")
         convs = r.json() if r and r.ok else []
 
         if st.button("➕ New conversation", use_container_width=True):
@@ -283,37 +368,28 @@ def render_sidebar():
                     st.session_state.debug_info      = []
                 st.rerun()
 
-        # ── Document upload (admin section) ────────────────────────────────────
+        # ── Document upload ────────────────────────────────────────────────────
         st.divider()
         st.markdown("**📄 Upload Knowledge Documents**")
-
         with st.expander("Upload PDF"):
             _render_upload_form()
 
-        # ── App version ────────────────────────────────────────────────────────
+        # ── Logout ─────────────────────────────────────────────────────────────
         st.divider()
-        st.caption("v8.0.0 — Agentic Advisor")
+        if st.button("🚪 Log Out", use_container_width=True):
+            for key in ["token", "user_id", "user_name", "user_email", "profile",
+                        "conversation_id", "messages", "debug_info"]:
+                st.session_state[key] = None if key == "token" else (
+                    {} if key == "profile" else ([] if key in ("messages", "debug_info") else None)
+                )
+            st.session_state.active_page = "chat"
+            st.rerun()
+
+        st.caption("v10.0.0 — Auth + Dedup + Eval")
 
 
 def _render_upload_form():
-    """
-    PDF upload form in the sidebar.
-
-    TIMEOUT FIX
-    ───────────
-    Contextual enrichment processes chunks in batches of CONTEXT_BATCH_SIZE
-    (default 5), with a CONTEXT_INTER_BATCH_DELAY pause (default 5s) between
-    batches, plus the LLM call itself (~1-3s on local Qwen3:1.7b, more if it
-    falls back/retries). For a 133-chunk PDF like in your log:
-        133 chunks ÷ 5 per batch ≈ 27 batches
-        27 batches × (LLM call ~2s + 5s pause) ≈ 27 × 7s ≈ 189s (~3 minutes)
-    The OLD hardcoded 60s timeout always failed on anything over ~40 chunks.
-
-    We now estimate a generous timeout from the PDF's page count (each PDF
-    page becomes roughly one chunk in this pipeline — see data_loader.py),
-    with a wide safety margin, and show the estimate to the user up front so
-    a 3-minute wait doesn't feel like a hang.
-    """
+    """PDF upload form with deduplication-aware error handling and time estimate."""
     uploaded = st.file_uploader("PDF file", type=["pdf"], label_visibility="collapsed")
     if not uploaded:
         return
@@ -325,65 +401,41 @@ def _render_upload_form():
     tags     = st.text_input("Tags (comma-separated)", key="tags_inp")
     use_ctx  = st.checkbox("Contextual enrichment (slower, smarter)", value=False)
 
-    # ── Estimate processing time so the user knows what to expect ─────────────
-    # Cheap page-count check using pypdf (already a transitive dep via
-    # llama-index-readers-file). Falls back gracefully if it's unavailable.
-    est_pages = None
+    # Time estimate
+    est_pages, est_seconds = None, None
     try:
         import pypdf
         reader    = pypdf.PdfReader(uploaded)
         est_pages = len(reader.pages)
-        uploaded.seek(0)  # reset stream position after reading for the count
+        uploaded.seek(0)
     except Exception:
-        pass  # estimate unavailable — we'll just use a safe default timeout
+        pass
 
     if use_ctx and est_pages:
-        # Match the auto-detection logic in main.py:
-        # local Ollama → batch_size=20, delay=0s, ~3s per batch call
-        # cloud Gemini → batch_size=5,  delay=5s, ~8s per batch call
-        # We don't know the provider from the UI, but we can read the env var
-        # to give an accurate estimate. Default assumes local (Ollama).
-        enrich_provider = os.getenv("ENRICHMENT_PROVIDER", "ollama").lower()
-        is_local        = enrich_provider == "ollama"
-
-        default_batch  = int(os.getenv("CONTEXT_BATCH_SIZE",        "20" if is_local else "5"))
-        default_delay  = float(os.getenv("CONTEXT_INTER_BATCH_DELAY", "0" if is_local else "5"))
-        call_time_s    = 3 if is_local else 5   # rough per-batch LLM time
-
-        est_batches  = max(1, -(-est_pages // default_batch))   # ceil division
-        est_seconds  = int(est_batches * (default_delay + call_time_s))
-        time_str     = f"{est_seconds // 60}m {est_seconds % 60}s" if est_seconds >= 60 else f"~{est_seconds}s"
-
+        is_local      = os.getenv("ENRICHMENT_PROVIDER", "ollama").lower() == "ollama"
+        batch_size    = int(os.getenv("CONTEXT_BATCH_SIZE", "20" if is_local else "5"))
+        delay         = float(os.getenv("CONTEXT_INTER_BATCH_DELAY", "0" if is_local else "5"))
+        est_batches   = max(1, -(-est_pages // batch_size))
+        est_seconds   = int(est_batches * (delay + (3 if is_local else 5)))
+        time_str      = (f"{est_seconds // 60}m {est_seconds % 60}s"
+                         if est_seconds >= 60 else f"~{est_seconds}s")
         st.info(
-            f"📄 **{est_pages} pages** → {est_batches} enrichment batches "
-            f"(batch size {default_batch}, delay {default_delay:.0f}s) → "
-            f"estimated **{time_str}**. "
-            + ("Local Qwen is fast — no rate-limit pauses. ✅" if is_local
-               else "Cloud provider — pauses between batches to respect RPM limits.")
+            f"📄 **{est_pages} pages** → {est_batches} batches → **{time_str}** "
+            + ("(local, no pauses) ✅" if is_local else "(cloud, includes pauses)")
         )
     elif use_ctx:
-        st.info(
-            "Contextual enrichment is on. Large PDFs (50+ pages) can take "
-            "several minutes — this is normal, not a hang."
-        )
+        st.info("Contextual enrichment on. Large PDFs take a few minutes.")
 
     if st.button("⬆️ Ingest PDF"):
-        # Generous timeout scaled to the estimate, with a hard floor of 5
-        # minutes and ceiling of 20 minutes (catches pathological cases
-        # without blocking the UI forever on a truly stuck request).
-        if use_ctx and est_pages:
-            dynamic_timeout = min(max(est_seconds + 60, 120), 1200)
-        else:
-            # No contextual enrichment → ingestion is just embedding + Qdrant
-            # upsert, which is fast even for large PDFs. Still give headroom.
-            dynamic_timeout = 300
+        dynamic_timeout = (
+            min(max((est_seconds or 0) + 60, 120), 1200)
+            if use_ctx and est_seconds else 300
+        )
 
-        progress_placeholder = st.empty()
-        progress_placeholder.info(
-            f"⏳ Ingesting… this window will wait up to {dynamic_timeout // 60} "
-            f"minutes. **Do not close this tab.** You can also watch progress "
-            f"live in your backend terminal (look for 'Contextual enrichment: "
-            f"chunks X–Y / N')."
+        placeholder = st.empty()
+        placeholder.info(
+            f"⏳ Ingesting… waiting up to {dynamic_timeout // 60}m. "
+            "Watch backend terminal for live progress."
         )
 
         with st.spinner("Ingesting…"):
@@ -400,235 +452,184 @@ def _render_upload_form():
                 },
             )
 
-        progress_placeholder.empty()
+        placeholder.empty()
 
         if r and r.ok:
             res = r.json()
-            st.success(f"✅ {res['chunks']} chunks ingested from {res['source']}")
+            st.success(f"✅ {res['chunks']} chunks ingested from **{res['source']}**")
             st.cache_data.clear()
         elif r is not None:
-            # api() returned a Response but it wasn't .ok (e.g. 400/500) —
-            # show the actual backend error instead of a generic message.
             try:
                 detail = r.json().get("detail", r.text)
             except Exception:
                 detail = r.text
-            st.error(f"Ingestion failed ({r.status_code}): {detail}")
+
+            # 409 = duplicate — give a specific, helpful message
+            if r.status_code == 409:
+                st.warning(f"⚠️ Duplicate detected: {detail}")
+            else:
+                st.error(f"Ingestion failed ({r.status_code}): {detail}")
         else:
-            # api() already showed a timeout/connection error via st.error.
-            # Since the backend often keeps processing after a client-side
-            # timeout (the request is server-side, not cancelled), offer a
-            # one-click way to check if it actually finished instead of
-            # forcing a re-upload.
-            if st.button("🔄 Check if ingestion actually finished"):
-                with st.spinner("Checking document list…"):
-                    check = api("get", "/documents/metadata", timeout=15)
+            # Timeout — offer a recovery check
+            if st.button("🔄 Check if ingestion finished"):
+                check = api("get", "/documents/metadata", timeout=15)
                 if check and check.ok:
-                    docs = check.json().get("documents", [])
+                    docs  = check.json().get("documents", [])
                     names = [d.get("filename", "") for d in docs]
                     if uploaded.name in names:
                         st.success(
-                            f"✅ Good news — '{uploaded.name}' IS in the knowledge "
-                            f"base. The ingestion succeeded; only the dashboard "
-                            f"connection timed out waiting for the response."
+                            f"✅ '{uploaded.name}' IS in the knowledge base. "
+                            "The ingestion succeeded — only the frontend connection timed out."
                         )
                         st.cache_data.clear()
                     else:
-                        st.warning(
-                            f"'{uploaded.name}' was not found yet. It may still "
-                            f"be processing — check your backend terminal for "
-                            f"progress, then try this check again in a minute."
-                        )
-
+                        st.warning("Not found yet. Check backend terminal and try again in a minute.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ③ CHAT PAGE
+# ③ CHAT PAGE (unchanged logic, auth now in api())
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_chat_page():
-    """Main chat interface with intent badge and web source display."""
     st.title("💬 AI Advisor Chat")
 
-    # Ensure a conversation exists
     if not st.session_state.conversation_id:
         rc = api("post", f"/users/{st.session_state.user_id}/conversations")
         if rc and rc.ok:
             st.session_state.conversation_id = rc.json()["conversation_id"]
 
-    # ── Message history ────────────────────────────────────────────────────────
     debug_idx = 0
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-            # Show debug info for assistant messages
             if msg["role"] == "assistant" and debug_idx < len(st.session_state.debug_info):
                 info = st.session_state.debug_info[debug_idx]
                 debug_idx += 1
 
-                # Intent badge
-                intent = info.get("intent")
-                if intent:
-                    st.markdown(_intent_badge(intent), unsafe_allow_html=True)
+                if info.get("intent"):
+                    st.markdown(_intent_badge(info["intent"]), unsafe_allow_html=True)
 
-                # Web sources (if any)
                 web_sources = info.get("web_sources", [])
                 if web_sources:
-                    with st.expander(f"🔍 {len(web_sources)} live web source(s) checked"):
+                    with st.expander(f"🔍 {len(web_sources)} live web source(s)"):
                         for src in web_sources:
                             title = src.get("title") or src.get("url", "")
                             url   = src.get("url", "")
-                            if url:
-                                st.markdown(f"- [{title}]({url})")
-                            else:
-                                st.markdown(f"- {title}")
+                            st.markdown(f"- [{title}]({url})" if url else f"- {title}")
 
-                # RAG sources
-                sources = info.get("sources", [])
-                if sources:
-                    with st.expander(f"📄 {len(sources)} knowledge source(s) used"):
-                        for s in sources:
+                if info.get("sources"):
+                    with st.expander(f"📄 {len(info['sources'])} knowledge source(s)"):
+                        for s in info["sources"]:
                             st.markdown(f"- `{s}`")
 
-                # Rewrite notice
-                rewritten = info.get("rewritten_question")
-                if rewritten:
-                    st.caption(f"🔄 Query rewritten to: *{rewritten}*")
+                if info.get("rewritten_question"):
+                    st.caption(f"🔄 Query rewritten: *{info['rewritten_question']}*")
 
-    # ── Force intent toggle (power user option) ────────────────────────────────
     with st.expander("⚙️ Advanced: force search mode", expanded=False):
         force_intent = st.selectbox(
             "Pin the planner to a specific mode (optional)",
-            options=["Auto (recommended)", "rag_only", "web_search",
-                     "university_recommender", "recommend_and_search"],
+            ["Auto (recommended)", "rag_only", "web_search",
+             "university_recommender", "recommend_and_search"],
             key="force_intent_select",
         )
 
-    # ── Chat input ─────────────────────────────────────────────────────────────
     user_input = st.chat_input("Ask me anything about studying in Germany…")
     if not user_input:
         return
 
-    # Display user message immediately
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Resolve forced intent (None = auto)
-    resolved_intent = (
-        None if force_intent == "Auto (recommended)" else force_intent
-    )
+    resolved_intent = None if force_intent == "Auto (recommended)" else force_intent
 
-    # ── Call backend ──────────────────────────────────────────────────────────
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
-            payload = {
-                "question":        user_input,
-                "user_id":         st.session_state.user_id,
-                "conversation_id": st.session_state.conversation_id,
-                "use_hybrid":      True,
+            r = api("post", "/query", json={
+                "question":             user_input,
+                "user_id":              st.session_state.user_id,
+                "conversation_id":      st.session_state.conversation_id,
+                "use_hybrid":           True,
                 "use_window_expansion": True,
-                "force_intent":    resolved_intent,
-            }
-            r = api("post", "/query", json=payload)
+                "force_intent":         resolved_intent,
+            })
 
         if not r or not r.ok:
-            st.error("Backend error. Please check that the server is running.")
+            st.error("Backend error. Is the server running?")
             return
 
-        data = r.json()
-
-        # Display answer
-        st.markdown(data["answer"])
-
-        # Intent badge
+        data   = r.json()
         intent = data.get("intent")
+
+        st.markdown(data["answer"])
         if intent:
             st.markdown(_intent_badge(intent), unsafe_allow_html=True)
 
-        # Web sources
         web_sources = data.get("web_sources") or []
         if web_sources:
-            with st.expander(f"🔍 {len(web_sources)} live web source(s) checked"):
+            with st.expander(f"🔍 {len(web_sources)} live web source(s)"):
                 for src in web_sources:
-                    title = src.get("title") or src.get("url", "")
-                    url   = src.get("url", "")
-                    if url:
-                        st.markdown(f"- [{title}]({url})")
+                    url = src.get("url", "")
+                    st.markdown(f"- [{src.get('title', url)}]({url})" if url else f"- {src.get('title', '')}")
 
-        # RAG sources
         sources = data.get("sources", [])
         if sources:
-            with st.expander(f"📄 {len(sources)} knowledge source(s) used"):
+            with st.expander(f"📄 {len(sources)} knowledge source(s)"):
                 for s in sources:
                     st.markdown(f"- `{s}`")
 
-        # Rewrite notice
-        rewritten = data.get("rewritten_question")
-        if rewritten:
-            st.caption(f"🔄 Query rewritten to: *{rewritten}*")
+        if data.get("rewritten_question"):
+            st.caption(f"🔄 Query rewritten: *{data['rewritten_question']}*")
 
-    # Save to session
     st.session_state.messages.append({"role": "assistant", "content": data["answer"]})
     st.session_state.debug_info.append({
         "intent":             intent,
         "web_sources":        web_sources,
         "sources":            sources,
-        "rewritten_question": rewritten,
+        "rewritten_question": data.get("rewritten_question"),
     })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ④ UNIVERSITY FINDER PAGE (NEW v8)
+# ④ UNIVERSITY FINDER PAGE (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_university_finder():
-    """
-    Dedicated university recommendation page.
-    Calls POST /recommend with the student's saved profile.
-    """
     st.title("🏫 University Finder")
     st.caption(
-        "Based on your profile, the hybrid recommender filters universities by your "
-        "hard constraints (city, language, budget) and then ranks them by how well "
-        "they match your academic interests."
+        "SQL hard-filter on your constraints → vector soft-match on your interests → ranked results."
     )
 
     profile = st.session_state.profile
-
-    # ── Profile summary ────────────────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Target Degree",   profile.get("target_degree", "Not set"))
-    col2.metric("Field of Study",  profile.get("field_of_study", "Not set"))
-    col3.metric("Monthly Budget",  f"€{profile.get('budget_monthly_eur', '?')}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Target Degree",  profile.get("target_degree",  "Not set"))
+    c2.metric("Field of Study", profile.get("field_of_study", "Not set"))
+    c3.metric("Monthly Budget", f"€{profile.get('budget_monthly_eur', '?')}")
 
     st.info(
-        f"**Preferred cities:** {profile.get('target_cities', 'Any')}  •  "
-        f"**German level:** {profile.get('german_level', 'Not set')}  •  "
-        f"**Target intake:** {profile.get('intake_semester', 'Not set')}"
+        f"**Cities:** {profile.get('target_cities', 'Any')}  •  "
+        f"**German:** {profile.get('german_level', 'Not set')}  •  "
+        f"**Intake:** {profile.get('intake_semester', 'Not set')}"
     )
 
-    # ── Optional free-text query to improve vector matching ───────────────────
     extra_query = st.text_input(
-        "Describe what matters most to you (optional, improves matching):",
-        placeholder="e.g. strong AI research, English-taught, near industry hub, good nightlife",
+        "Describe what matters most (optional — improves ranking):",
+        placeholder="e.g. strong AI research, English-taught, good industry connections",
         key="uni_extra_query",
     )
-
-    top_k = st.slider("Number of recommendations", min_value=1, max_value=10, value=5)
+    top_k = st.slider("Number of recommendations", 1, 10, 5)
 
     if st.button("🔍 Find Universities", type="primary"):
-        with st.spinner("Searching and ranking universities…"):
-            payload = {
+        with st.spinner("Filtering and ranking…"):
+            r = api("post", "/recommend", json={
                 "profile":  profile,
                 "question": extra_query,
                 "top_k":    top_k,
-            }
-            r = api("post", "/recommend", json=payload)
+            })
 
         if not r or not r.ok:
-            st.error("Could not reach the recommender. Is the backend running?")
+            st.error("Could not reach the recommender.")
             return
 
         data  = r.json()
@@ -637,78 +638,252 @@ def show_university_finder():
 
         if not unis:
             st.warning(
-                f"No universities matched your profile's hard constraints "
-                f"(degree, field, city, language, budget). "
-                f"Try relaxing your preferred cities or budget in your profile."
+                "No universities matched your hard constraints. "
+                "Try relaxing city, budget, or language requirements in your profile."
             )
             return
 
-        st.success(f"Found **{total}** matching programs. Showing top {len(unis)}:")
+        st.success(f"**{total}** programs passed hard filters. Showing top {len(unis)}:")
         st.divider()
 
         for i, uni in enumerate(unis, 1):
-            # ── University card ────────────────────────────────────────────────
-            score   = uni.get("match_score", 0.5)
-            pct     = int(score * 100)
-            lang    = uni.get("language", "—")
+            score     = uni.get("match_score", 0.5)
+            lang      = uni.get("language", "—")
             lang_icon = "🇬🇧" if lang == "English" else "🇩🇪" if lang == "German" else "🌍"
 
             with st.container(border=True):
                 h_col, s_col = st.columns([3, 1])
                 with h_col:
                     st.markdown(
-                        f"### {i}. {uni['name']}  "
-                        f"<span style='font-size:0.85rem; color:grey;'>"
+                        f"### {i}. {uni['name']} "
+                        f"<span style='font-size:0.85rem;color:grey'>"
                         f"{uni.get('city','')}, {uni.get('state','')}</span>",
                         unsafe_allow_html=True,
                     )
                     if uni.get("program_name"):
                         st.markdown(f"**Program:** {uni['program_name']}")
-
                 with s_col:
-                    # Match score progress bar
-                    st.markdown(f"**Match: {pct}%**")
+                    st.markdown(f"**Match: {int(score*100)}%**")
                     st.progress(score)
 
-                # Key facts in columns
                 f1, f2, f3, f4 = st.columns(4)
-                f1.markdown(f"**Language**  \n{lang_icon} {lang}")
-                f2.markdown(f"**Semester fee**  \n€{uni.get('semester_fee_eur', '?')}")
-                f3.markdown(f"**German required**  \n{uni.get('german_required', '—')}")
-                f4.markdown(f"**Min. GPA (DE)**  \n{uni.get('min_gpa', '—')}")
+                f1.markdown(f"**Language**\n{lang_icon} {lang}")
+                f2.markdown(f"**Semester fee**\n€{uni.get('semester_fee_eur','?')}")
+                f3.markdown(f"**German req.**\n{uni.get('german_required','—')}")
+                f4.markdown(f"**Min GPA**\n{uni.get('min_gpa','—')}")
 
-                # Deadlines
-                d_col1, d_col2 = st.columns(2)
+                d1, d2 = st.columns(2)
                 if uni.get("winter_deadline"):
-                    d_col1.markdown(f"📅 **Winter deadline:** {uni['winter_deadline']}")
+                    d1.markdown(f"📅 Winter: **{uni['winter_deadline']}**")
                 if uni.get("summer_deadline"):
-                    d_col2.markdown(f"📅 **Summer deadline:** {uni['summer_deadline']}")
+                    d2.markdown(f"📅 Summer: **{uni['summer_deadline']}**")
 
-                # Research areas
                 if uni.get("research_areas"):
-                    st.markdown(f"🔬 **Research areas:** {uni['research_areas']}")
-
-                # Strengths
+                    st.markdown(f"🔬 {uni['research_areas']}")
                 if uni.get("strengths"):
                     st.markdown(f"⭐ {uni['strengths']}")
-
-                # Match reason
                 if uni.get("match_reason"):
-                    st.caption(f"💡 Why matched: {uni['match_reason']}")
-
-                # Official link
+                    st.caption(f"💡 {uni['match_reason']}")
                 if uni.get("url"):
-                    st.markdown(f"[🔗 Official program page]({uni['url']})")
+                    st.markdown(f"[🔗 Official page]({uni['url']})")
 
-            st.write("")  # vertical spacing between cards
+            st.write("")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⑤ PROFILE EDITOR PAGE
+# ⑤ EVAL DASHBOARD PAGE (new in v10)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def show_eval_page():
+    """
+    Evaluation dashboard with two sections:
+      A. Question management — generate / view / delete the synthetic eval dataset
+      B. Run history — line chart of Hit Rate and MRR over time + on-demand triggers
+    """
+    st.title("📊 Evaluation Dashboard")
+    st.caption(
+        "Track retrieval quality over time. "
+        "Retrieval metrics (Hit Rate, MRR) are free and fast. "
+        "Answer quality (RAGAS faithfulness + relevancy) costs Gemini quota — run on-demand."
+    )
+
+    # ── Section A: Question dataset ────────────────────────────────────────────
+    st.subheader("A. Eval Question Dataset")
+
+    r_q = api("get", "/eval/questions")
+    questions = r_q.json().get("questions", []) if r_q and r_q.ok else []
+    st.metric("Stored eval questions", len(questions))
+
+    col_gen, col_del = st.columns(2)
+
+    with col_gen:
+        n_gen = st.number_input("Questions to generate", min_value=5, max_value=100,
+                                value=20, step=5, key="n_gen")
+        if st.button("⚙️ Generate Questions", type="primary", use_container_width=True):
+            with st.spinner(
+                f"Sampling {n_gen} chunks and generating questions via local Qwen… "
+                "This may take a minute."
+            ):
+                r = api("post", f"/eval/generate-questions?n={n_gen}", timeout=300)
+            if r and r.ok:
+                data = r.json()
+                st.success(f"✅ Generated {data['generated']} questions.")
+                st.rerun()
+            elif r:
+                st.error(r.json().get("detail", "Generation failed."))
+
+    with col_del:
+        st.write("")
+        st.write("")
+        if st.button("🗑 Delete All Questions", use_container_width=True):
+            r = api("delete", "/eval/questions")
+            if r and r.ok:
+                st.success(f"Deleted {r.json()['deleted']} questions.")
+                st.rerun()
+
+    if questions:
+        with st.expander(f"Preview {min(5, len(questions))} questions"):
+            for q in questions[:5]:
+                st.markdown(f"- **{q['question']}**  \n  ↳ source: `{q['source_doc']}`")
+
+    st.divider()
+
+    # ── Section B: Run history and triggers ────────────────────────────────────
+    st.subheader("B. Eval Runs")
+
+    r_runs = api("get", "/eval/runs")
+    runs   = r_runs.json().get("runs", []) if r_runs and r_runs.ok else []
+
+    # ── Metric chart ───────────────────────────────────────────────────────────
+    if runs:
+        import pandas as pd
+
+        retrieval_runs = [r for r in runs if r["run_type"] == "retrieval" and r.get("hit_rate") is not None]
+        aq_runs        = [r for r in runs if r["run_type"] == "answer_quality"]
+
+        if retrieval_runs:
+            st.markdown("**Retrieval metrics over time**")
+            df = pd.DataFrame([{
+                "Date":      r["ran_at"][:10],
+                "Hit Rate":  round(r["hit_rate"], 3),
+                "MRR":       round(r.get("mrr") or 0, 3),
+                "Questions": r["num_questions"],
+            } for r in retrieval_runs])
+            st.line_chart(df.set_index("Date")[["Hit Rate", "MRR"]])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if aq_runs:
+            st.markdown("**Answer quality metrics over time**")
+            df_aq = pd.DataFrame([{
+                "Date":             r["ran_at"][:10],
+                "Faithfulness":     round(r.get("faithfulness") or 0, 3),
+                "Answer Relevancy": round(r.get("answer_relevancy") or 0, 3),
+                "Questions":        r["num_questions"],
+            } for r in aq_runs])
+            st.line_chart(df_aq.set_index("Date")[["Faithfulness", "Answer Relevancy"]])
+            st.dataframe(df_aq, use_container_width=True, hide_index=True)
+    else:
+        st.info("No eval runs yet. Generate questions and run an evaluation below.")
+
+    st.divider()
+
+    # ── Run triggers ───────────────────────────────────────────────────────────
+    st.subheader("Run Evaluation")
+
+    trig_col1, trig_col2 = st.columns(2)
+
+    with trig_col1:
+        with st.container(border=True):
+            st.markdown("**🚀 Retrieval Eval**")
+            st.caption("Hit Rate + MRR. Fast, free, no LLM calls.")
+            top_k_r = st.slider("Top-K", 1, 10, 5, key="ret_topk")
+            notes_r = st.text_input("Notes (optional)", key="ret_notes",
+                                    placeholder="e.g. after adding 5 new PDFs")
+            if st.button("Run Retrieval Eval", type="primary", use_container_width=True):
+                if not questions:
+                    st.warning("Generate eval questions first (Section A above).")
+                else:
+                    with st.spinner(f"Running retrieval eval on {len(questions)} questions…"):
+                        r = api("post",
+                                f"/eval/run-retrieval?top_k={top_k_r}&notes={notes_r}",
+                                timeout=600)
+                    if r and r.ok:
+                        res = r.json()
+                        st.success(
+                            f"✅ Done — Hit Rate: **{res['hit_rate']:.1%}** | "
+                            f"MRR: **{res['mrr']:.3f}** (n={res['n']})"
+                        )
+                        st.rerun()
+                    elif r:
+                        st.error(r.json().get("detail", "Eval failed."))
+
+    with trig_col2:
+        with st.container(border=True):
+            st.markdown("**🧪 Answer Quality Eval** *(on-demand)*")
+            st.caption("RAGAS faithfulness + relevancy. Costs Gemini quota.")
+            n_aq    = st.number_input("Questions to sample", 3, 20, 10, key="aq_n")
+            top_k_a = st.slider("Top-K", 1, 10, 5, key="aq_topk")
+            notes_a = st.text_input("Notes (optional)", key="aq_notes")
+            if st.button("Run Answer Quality Eval", use_container_width=True):
+                if not questions:
+                    st.warning("Generate eval questions first (Section A above).")
+                else:
+                    with st.spinner(
+                        f"Running RAGAS eval on {n_aq} questions… "
+                        f"~{n_aq * 7} Gemini calls, may take several minutes."
+                    ):
+                        r = api("post",
+                                f"/eval/run-answer-quality?n_questions={n_aq}"
+                                f"&top_k={top_k_a}&notes={notes_a}",
+                                timeout=900)
+                    if r and r.ok:
+                        res = r.json()
+                        faith   = res.get("faithfulness")
+                        relev   = res.get("answer_relevancy")
+                        st.success(
+                            f"✅ Done — Faithfulness: **{faith:.1%}** | "
+                            f"Relevancy: **{relev:.1%}** (n={res['n']})"
+                            if faith and relev else
+                            f"✅ Done (n={res['n']}) — some metrics may be None if LLM calls failed."
+                        )
+                        st.rerun()
+                    elif r:
+                        st.error(r.json().get("detail", "Eval failed."))
+
+    # ── Drill-down: per-question results ───────────────────────────────────────
+    if runs:
+        st.divider()
+        st.subheader("Drill-down: per-question results")
+        run_options = {
+            f"{r['ran_at'][:16]} | {r['run_type']} | n={r['num_questions']}": r["id"]
+            for r in runs
+        }
+        selected_label = st.selectbox("Select a run", options=list(run_options.keys()))
+        selected_run_id = run_options[selected_label]
+
+        if st.button("Load results"):
+            r_det = api("get", f"/eval/runs/{selected_run_id}", timeout=30)
+            if r_det and r_det.ok:
+                import pandas as pd
+                results = r_det.json().get("results", [])
+                if results:
+                    df_det = pd.DataFrame([{
+                        "Question":    res["question"][:80],
+                        "Hit":         "✅" if res.get("hit") else "❌",
+                        "Rank":        res.get("rank") or "—",
+                        "Faithfulness": f"{res['faithfulness']:.2f}" if res.get("faithfulness") else "—",
+                        "Relevancy":   f"{res['answer_relevancy']:.2f}" if res.get("answer_relevancy") else "—",
+                    } for res in results])
+                    st.dataframe(df_det, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No per-question results found for this run.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⑥ PROFILE EDITOR PAGE (unchanged logic)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_profile_editor():
-    """Let the student update their profile at any time."""
     st.title("👤 Edit Your Profile")
     st.caption("Updating your profile improves all recommendations and advice.")
 
@@ -716,7 +891,6 @@ def show_profile_editor():
 
     with st.form("edit_profile_form"):
         new_profile: dict = {}
-
         for field in PROFILE_FIELDS:
             key     = field["key"]
             label   = field["label"]
@@ -735,16 +909,14 @@ def show_profile_editor():
             elif field["type"] == "textarea":
                 new_profile[key] = st.text_area(label, value=str(current), help=help_)
 
-        saved = st.form_submit_button("💾 Save profile")
-
-    if saved:
-        r = api("put", f"/users/{st.session_state.user_id}/profile",
-                json={"profile": new_profile})
-        if r and r.ok:
-            st.session_state.profile = new_profile
-            st.success("✅ Profile updated!")
-        else:
-            st.error("Could not save profile.")
+        if st.form_submit_button("💾 Save profile"):
+            r = api("put", f"/users/{st.session_state.user_id}/profile",
+                    json={"profile": new_profile})
+            if r and r.ok:
+                st.session_state.profile = new_profile
+                st.success("✅ Profile updated!")
+            else:
+                st.error("Could not save profile.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -752,20 +924,20 @@ def show_profile_editor():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # If no user is set up, show the onboarding screen
-    if not st.session_state.user_id:
-        show_profile_setup()
+    # Show auth page if not logged in
+    if not st.session_state.token:
+        show_auth_page()
         return
 
-    # Render sidebar for logged-in users
     render_sidebar()
 
-    # Route to the active page
     page = st.session_state.active_page
     if page == "chat":
         show_chat_page()
     elif page == "universities":
         show_university_finder()
+    elif page == "eval":
+        show_eval_page()
     elif page == "profile":
         show_profile_editor()
     else:

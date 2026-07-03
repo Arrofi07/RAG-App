@@ -28,6 +28,13 @@ dependencies = [
     # ── Vector store ───────────────────────────────────────────────────────────
     "qdrant-client>=1.18.0",
 
+    # ── Auth (v10) ─────────────────────────────────────────────────────────────
+    # passlib[bcrypt] — password hashing. bcrypt is intentionally slow (work
+    # factor 12 ≈ 250ms/hash) to make brute-force attacks expensive.
+    "passlib[bcrypt]>=1.7.4",
+    # python-jose — JWT creation and verification (HS256).
+    "python-jose[cryptography]>=3.3.0",
+
     # ── PDF loading and chunking ───────────────────────────────────────────────
     "llama-index-core>=0.14.22",
     "llama-index-readers-file>=0.6.0",

@@ -13,5 +13,4 @@ data
 # Virtual environments
 .venv
 
-*.env
 .env
