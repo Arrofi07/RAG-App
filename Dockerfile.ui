@@ -1,0 +1,33 @@
+# Dockerfile.ui — Streamlit frontend
+#
+# Lighter than the API image: no ML libraries, no torch, no FlagEmbedding.
+# Only needs streamlit + requests + python-dotenv.
+
+FROM python:3.12-slim
+
+RUN useradd --create-home appuser
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    streamlit>=1.58.0 \
+    requests>=2.32.0 \
+    python-dotenv>=1.2.2
+
+COPY streamlit_app.py  .
+COPY advisor_config.py .
+COPY custom_types.py   .
+
+RUN mkdir -p /app/uploads && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')" \
+    || exit 1
+
+CMD ["streamlit", "run", "streamlit_app.py", \
+     "--server.port=8501", \
+     "--server.address=0.0.0.0", \
+     "--server.headless=true", \
+     "--browser.gatherUsageStats=false"]

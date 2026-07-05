@@ -9,12 +9,14 @@ dependencies = [
     # ── API framework ──────────────────────────────────────────────────────────
     "fastapi>=0.136.3",
     "uvicorn>=0.49.0",
+
     # ── Local embedding + reranking (bge-m3 / bge-reranker-v2-m3) ─────────────
     # FlagEmbedding loads both dense (1024-dim) and sparse (BM25-style) vectors
     # from a single BAAI/bge-m3 model — no separate sparse model needed.
     # On M2: model downloads once to ~/.cache/huggingface and is reused.
     "FlagEmbedding>=1.3.0",
     "sentence-transformers>=3.0.0",
+
     # ── LLM providers (v9: multi-provider via llm_providers.py) ────────────────
     # google-genai — used for the "answer" role by default, and for web search
     # grounding (real-time deadline lookups in web_search_tool.py).
@@ -22,13 +24,10 @@ dependencies = [
     # requests — used by OllamaProvider for local HTTP calls to localhost:11434.
     # No extra setup needed; Ollama itself is a separate binary (brew install ollama).
     "requests>=2.32.0",
+
     # ── Vector store ───────────────────────────────────────────────────────────
     "qdrant-client>=1.18.0",
-    # ── Auth (v10) ─────────────────────────────────────────────────────────────
-    # passlib[bcrypt] — password hashing. bcrypt is intentionally slow (work
-    # factor 12 ≈ 250ms/hash) to make brute-force attacks expensive.
-    # python-jose — JWT creation and verification (HS256).
-    "python-jose[cryptography]>=3.3.0",
+
     # ── PDF loading and chunking ───────────────────────────────────────────────
     "llama-index-core>=0.14.22",
     "llama-index-readers-file>=0.6.0",
@@ -36,13 +35,15 @@ dependencies = [
     # pinned explicitly because streamlit_app.py imports it directly to
     # estimate ingestion time (page count → expected enrichment batches).
     "pypdf>=4.0.0",
+
     # ── Numerical operations (vector similarity in recommender) ────────────────
     "numpy>=1.26.0",
+
     # ── Streamlit UI ───────────────────────────────────────────────────────────
     "streamlit>=1.58.0",
+
     # ── Utilities ─────────────────────────────────────────────────────────────
     "python-dotenv>=1.2.2",
-    "bcrypt==5.0.0",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +53,16 @@ dependencies = [
 # Not needed for the default setup (Ollama for enrichment/planning, Gemini for answers).
 openai-compat = [
     "openai>=1.40.0",
+]
+
+# Install with: uv sync --extra dev
+# Run tests with: uv run pytest
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",   # for any async test cases
+    "httpx>=0.27.0",             # required by FastAPI TestClient
+    "python-jose[cryptography]>=3.3.0",  # JWT (also a runtime dep via auth.py)
+    "passlib[bcrypt]>=1.7.4",   # password hashing (also a runtime dep via auth.py)
 ]
 
 # ── Notes for M2 / 8 GB RAM ───────────────────────────────────────────────────
