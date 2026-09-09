@@ -168,6 +168,7 @@ class Storage:
                 "password_hash": "TEXT",
                 "is_verified":   "INTEGER DEFAULT 0",
                 "is_active":     "INTEGER DEFAULT 1",
+                "is_admin":      "INTEGER DEFAULT 0",
             }
             for col, definition in new_columns.items():
                 if col not in existing:

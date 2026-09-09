@@ -117,6 +117,18 @@ recommender = UniversityRecommender(db_path=Path("data/chatbot.db"))
 MAX_HISTORY_TURNS = int(os.getenv("MAX_HISTORY_TURNS", "10"))
 
 
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    """
+    Admin-only dependency. Re-checks is_admin from the DB on every request
+    (rather than trusting a claim baked into the JWT) so revoking admin
+    access takes effect immediately instead of waiting out the token's life.
+    """
+    user = db.get_user(current_user["sub"])
+    if not user or not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return current_user
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Request models
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,11 +152,6 @@ class RecommendRequest(BaseModel):
     profile:   dict[str, Any]
     question:  str            = ""
     top_k:     int            = 5
-
-
-class CreateUserRequest(BaseModel):
-    name:    str
-    profile: dict[str, Any] = {}
 
 
 class UpdateProfileRequest(BaseModel):
@@ -414,15 +421,8 @@ def me(current_user: dict = Depends(get_current_user)):
 # User / profile endpoints (unchanged from v7)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/users", response_model=UserInfo)
-def create_user(req: CreateUserRequest):
-    uid  = db.create_user(name=req.name, profile=req.profile)
-    user = db.get_user(uid)
-    return UserInfo(**{**user, "profile": user["profile"]})
-
-
 @app.get("/users", response_model=list[UserInfo])
-def list_users():
+def list_users(current_user: dict = Depends(require_admin)):
     users = db.list_users()
     result = []
     for u in users:
@@ -433,7 +433,11 @@ def list_users():
 
 
 @app.get("/users/{user_id}", response_model=UserInfo)
-def get_user(user_id: str):
+def get_user(user_id: str, current_user: dict = Depends(get_current_user)):
+    if current_user["sub"] != user_id:
+        requester = db.get_user(current_user["sub"])
+        if not requester or not requester.get("is_admin"):
+            raise HTTPException(status_code=403, detail="Cannot view another user's info.")
     user = db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
@@ -1001,7 +1005,7 @@ def recommend(req: RecommendRequest):
 
 
 @app.post("/seed-universities")
-def seed_universities():
+def seed_universities(current_user: dict = Depends(require_admin)):
     """
     (Admin endpoint) Re-seed the university database and recompute embeddings.
     Safe to call multiple times — it only inserts if the table is empty.
