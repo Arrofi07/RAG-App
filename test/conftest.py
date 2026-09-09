@@ -118,13 +118,18 @@ sys.modules.setdefault("google.genai",      _genai_mod)
 sys.modules.setdefault("google.genai.types", _types_mod)
 sys.modules.setdefault("google.genai.errors", _errors_mod)
 
-# jose / passlib — real packages; only stub if not installed
+# jose / passlib — real packages; only stub if not installed.
+# Each is checked independently so one missing package doesn't cause the
+# other's real module to be shadowed by a stub.
 try:
     import jose          # noqa
-    import passlib       # noqa
 except ImportError:
     sys.modules.setdefault("jose",            _make_stub_module("jose"))
     sys.modules.setdefault("jose.jwt",        _make_stub_module("jose.jwt"))
+
+try:
+    import passlib       # noqa
+except ImportError:
     sys.modules.setdefault("passlib",         _make_stub_module("passlib"))
     sys.modules.setdefault("passlib.context", _make_stub_module("passlib.context"))
 
