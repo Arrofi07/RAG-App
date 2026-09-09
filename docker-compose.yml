@@ -21,14 +21,20 @@
 # ollama_models  → Ollama model weights (qwen3:1.7b, ~1.1 GB, pulls once)
 # app_data       → SQLite database + uploaded PDFs
 #
+# HEALTHCHECK STRATEGY
+# ─────────────────────
+# qdrant / ollama   → NO healthcheck. These are third-party minimal images
+#                     that ship without curl, wget, or Python. Instead, the
+#                     api service uses `restart: on-failure` + `start_period`
+#                     to retry until both dependencies are ready.
+# api               → checked with Python's stdlib urllib (Python is always
+#                     present because we built the image FROM python:3.12-slim).
+# ui                → checked via Streamlit's built-in /_stcore/health endpoint.
+#
 # NOTES FOR M2 / APPLE SILICON
 # ──────────────────────────────
-# Docker Desktop on Apple Silicon runs containers via Rosetta 2 (x86 emulation)
-# by default.  For native ARM performance, ensure Docker Desktop → Settings →
-# "Use Rosetta for x86/amd64 emulation" is ON, or use colima with --arch arm64.
-# MPS acceleration for the reranker is NOT available inside Docker on macOS
-# (MPS is a host GPU API and doesn't pass through to containers).
-# The reranker will run on CPU inside Docker — still fast enough for demo use.
+# MPS GPU access is NOT available inside Docker on macOS.
+# The reranker runs on CPU inside the container — fast enough for demo use.
 
 services:
 
@@ -38,16 +44,12 @@ services:
     container_name: rag_qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"   # REST API (used by qdrant-client)
-      - "6334:6334"   # gRPC (not used, but exposed for tooling)
+      - "6333:6333"
+      - "6334:6334"
     volumes:
       - qdrant_data:/qdrant/storage
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:6333/healthz')\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+    # No healthcheck — qdrant/qdrant is a minimal image with no shell tools.
+    # The api container handles the timing via restart + start_period.
 
   # ── Ollama local LLM server ───────────────────────────────────────────────
   ollama:
@@ -58,21 +60,16 @@ services:
       - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
-    # Pull the planning/enrichment model on first startup.
-    # Change this to match ENRICHMENT_MODEL / PLANNING_MODEL in your .env.
+    # Start server, then pull the model (downloads ~1.1 GB on first run only).
     entrypoint: >
       sh -c "ollama serve &
              sleep 5 &&
              ollama pull ${OLLAMA_MODEL:-qwen3:1.7b} &&
              wait"
     environment:
-      OLLAMA_KEEP_ALIVE: "24h"    # keep model loaded in RAM between calls
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:11434/api/tags')\""]
-      interval: 15s
-      timeout: 10s
-      retries: 8
-      start_period: 60s   # model pull can take a while
+      OLLAMA_KEEP_ALIVE: "24h"
+    # No healthcheck — ollama/ollama is also a minimal image.
+    # The api service retries the Ollama connection automatically.
 
   # ── FastAPI backend ───────────────────────────────────────────────────────
   api:
@@ -80,34 +77,40 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: rag_api
-    restart: unless-stopped
+    # on-failure ensures Docker restarts the api if it crashes because Qdrant
+    # or Ollama weren't ready yet.  Combined with start_period on the
+    # healthcheck this gives the whole stack time to stabilise.
+    restart: on-failure
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      # Override localhost URLs to use Docker service names
-      QDRANT_URL:     "http://qdrant:6333"
+      QDRANT_URL:      "http://qdrant:6333"
       OLLAMA_BASE_URL: "http://ollama:11434"
-      HF_HOME:        "/app/.cache/huggingface"
-      # Tell HuggingFace to use only local cache after first download
-      # Set to 0 to allow re-downloading (e.g. after clearing the volume)
-      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      HF_HOME:         "/app/.cache/huggingface"
+      HF_HUB_OFFLINE:  "${HF_HUB_OFFLINE:-0}"
     volumes:
       - hf_cache:/app/.cache/huggingface
       - app_data:/app/data
       - app_data:/app/uploads
     depends_on:
-      qdrant:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
+      # service_started (not service_healthy) because qdrant/ollama have no
+      # healthchecks.  The api's own retry logic + restart policy handles timing.
+      - qdrant
+      - ollama
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/')\""]
+      # python3 IS available here — we built FROM python:3.12-slim
+      test: >
+        CMD-SHELL python3 -c
+        "import urllib.request, sys;
+        urllib.request.urlopen('http://localhost:8000/');
+        sys.exit(0)"
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 120s  # model loading on first boot takes 30-60s
+      # Give the api time to load bge-m3 + reranker on first boot (~60 s on M2)
+      start_period: 120s
 
   # ── Streamlit frontend ────────────────────────────────────────────────────
   ui:
