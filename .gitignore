@@ -15,3 +15,6 @@ data
 
 .env*
 !.env.example
+
+# Claude Code session runtime state (not project content)
+.claude/scheduled_tasks.lock

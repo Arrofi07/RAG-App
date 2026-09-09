@@ -132,6 +132,24 @@ The backend startup sequence on first run:
 3. Seed university database (~5 s, one-time)
 4. Server ready at http://localhost:8000
 
+### 5. Smoke test (optional)
+
+`scripts/smoke_test.sh` registers a throwaway admin + regular user,
+promotes the admin via SQLite, and checks that `/seed-universities` and
+`/users` correctly return 401 / 403 / 200 across no-token, non-admin,
+and admin requests. Safe to re-run anytime — each run uses a unique
+timestamped email.
+
+```bash
+./scripts/dev_up.sh       # starts Qdrant + the API server if not already up (idempotent)
+./scripts/smoke_test.sh   # 7 checks, prints Passed/Failed
+./scripts/dev_down.sh     # stops the API server, removes the dev Qdrant container
+```
+
+`dev_up.sh` is safe to run even if Qdrant and/or the server are already
+running — it detects and skips whatever's up. See
+`.claude/skills/run-api/SKILL.md` for the full launch reference.
+
 ---
 
 ## New API endpoints (v8)
